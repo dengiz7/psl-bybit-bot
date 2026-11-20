@@ -164,6 +164,7 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
         "plan_status": "unknown",
         "plan_status_text": "",
         "last_sim_trade": "",
+        "checked_tps": [],
         "entry": None,
         "tp1": None,
         "tp2": None,
@@ -213,12 +214,12 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
             if any(w in header_window for w in ("ÜST TF UYUMSUZ", "UYUMSUZ", "MISMATCH")):
                 result["plan_status"] = "mismatch"
                 result["plan_status_text"] = "ÜST TF UYUMSUZ"
-            elif any(w in header_window for w in ("TETİK BEKLİYOR", "AWAITING TRIGGER", "BEKLİYOR", "WAITING")):
+            elif any(w in header_window for w in ("TETİK BEKLENİYOR", "TETİK BEKLİYOR", "AWAITING TRIGGER", "BEKLENİYOR", "BEKLİYOR", "WAITING")):
                 result["plan_status"] = "waiting"
-                result["plan_status_text"] = "TETİK BEKLİYOR"
+                result["plan_status_text"] = "TETİK BEKLENİYOR"
             elif any(w in header_window for w in ("AKTİF", "ACTIVE")):
                 result["plan_status"] = "active"
-                result["plan_status_text"] = "AKTİF"
+                result["plan_status_text"] = "🟢 AKTİF (İŞLEM AÇIK)"
             elif any(w in header_window for w in ("HEDEFLERE ULAŞILDI", "TARGETS REACHED", "TAMAMLANDI")):
                 result["plan_status"] = "completed"
                 result["plan_status_text"] = "HEDEFLERE ULAŞILDI"
@@ -227,7 +228,7 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
                 result["plan_status_text"] = "KAPANDI"
             elif "—" in header_window or "| -" in header_window:
                 result["plan_status"] = "none"
-                result["plan_status_text"] = "Plan Bekleniyor (—)"
+                result["plan_status_text"] = "Plan Yok (—)"
 
         if not result["last_sim_trade"]:
             sim_match = re.match(
@@ -242,25 +243,36 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
         if uline.startswith("▍") or uline.startswith("# |") or "SONUÇLANAN" in uline:
             continue
 
-        if result["entry"] is None:
-            val = _extract_first_price(uline, r"\b(?:GİRİŞ|ENTRY)\b")
-            if val is not None:
-                result["entry"] = val
+        if "GİRİŞ" in uline or "ENTRY" in uline:
+            if any(w in uline for w in ("İŞLEM AÇIK", "TRADE OPEN")):
+                result["plan_status"] = "active"
+                result["plan_status_text"] = "🟢 AKTİF (İŞLEM AÇIK)"
+            if result["entry"] is None:
+                val = _extract_first_price(uline, r"\b(?:GİRİŞ|ENTRY)\b")
+                if val is not None:
+                    result["entry"] = val
 
         for tp_idx in range(1, 5):
             tp_key = f"tp{tp_idx}"
-            if result[tp_key] is None:
-                val = _extract_first_price(uline, rf"\b(?:HEDEF\s*{tp_idx}|TARGET\s*{tp_idx}|TP\s*{tp_idx})\b")
-                if val is not None:
-                    result[tp_key] = val
+            tp_pat = rf"\b(?:HEDEF\s*{tp_idx}|TARGET\s*{tp_idx}|TP\s*{tp_idx})\b"
+            if re.search(tp_pat, uline):
+                if ("✓" in uline or "✔" in uline) and tp_key not in result["checked_tps"]:
+                    result["checked_tps"].append(tp_key)
+                if result[tp_key] is None:
+                    val = _extract_first_price(uline, tp_pat)
+                    if val is not None:
+                        result[tp_key] = val
 
         if result["sl"] is None:
             val = _extract_first_price(uline, r"\b(?:GEÇERSİZ|INVALIDATION|STOP)\b")
             if val is not None:
                 result["sl"] = val
 
-    if result["last_sim_trade"]:
-        result["plan_status_text"] = result["last_sim_trade"]
+    if result["plan_status"] != "active" and result["last_sim_trade"]:
+        if result["plan_status_text"]:
+            result["plan_status_text"] = f"{result['plan_status_text']} · Son: {result['last_sim_trade']}"
+        else:
+            result["plan_status_text"] = result["last_sim_trade"]
     result["raw_lines"] = lines[:45]
     return result
 
@@ -403,6 +415,8 @@ class TradingViewPlaywrightWatcher:
                 "live_price": None,
                 "parsed_table": {},
                 "active_trade": None,
+                "last_entered_sig": None,
+                "non_active_streak": 0,
                 "last_update": None,
                 "needs_login_hint": False,
                 "last_error": None,
@@ -606,6 +620,8 @@ class TradingViewPlaywrightWatcher:
             study_ready = False
             latest_bar_time: Optional[int] = None
             latest_bar_plots: Optional[list[Any]] = None
+            sds_latest_bar_time: Optional[int] = None
+            sds_latest_close: Optional[float] = None
             fired_keys: set[str] = set()
             last_entry_bar_time: Optional[int] = None
 
@@ -654,6 +670,15 @@ class TradingViewPlaywrightWatcher:
                                     state["indicator_detected"] = True
                                     state["needs_login_hint"] = False
                                     state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    self._evaluate_live_table_and_price(
+                                        sym,
+                                        state,
+                                        state.get("parsed_table") or {},
+                                        None,
+                                        latest_bar_plots,
+                                        sds_latest_bar_time,
+                                        table_updated=True,
+                                    )
                                     self._sync_coins_status()
                                     continue
 
@@ -661,86 +686,114 @@ class TradingViewPlaywrightWatcher:
                                     continue
 
                                 payload_dict = params[1]
+                                sds_closed_bar: Optional[tuple[int, float]] = None
 
-                                # Anlık mum fiyatını güncelle (sds_1)
+                                # Anlık mum fiyatını ve kapanan mumu güncelle (sds_1)
                                 sds_data = payload_dict.get("sds_1")
                                 if isinstance(sds_data, dict):
-                                    bars = sds_data.get("s") or []
-                                    if bars:
-                                        last_v = bars[-1].get("v") or []
-                                        if len(last_v) >= 5:
-                                            close_p = _clean_num(last_v[4])
-                                            if close_p is not None:
-                                                state["live_price"] = close_p
+                                    for sbar in sds_data.get("s") or []:
+                                        bv = sbar.get("v") or []
+                                        if len(bv) < 5:
+                                            continue
+                                        bt_raw = _clean_num(bv[0])
+                                        bc = _clean_num(bv[4])
+                                        if bt_raw is None or bc is None:
+                                            continue
+                                        bt = int(bt_raw)
+                                        if (
+                                            study_ready
+                                            and sds_latest_bar_time is not None
+                                            and bt > sds_latest_bar_time
+                                            and sds_latest_close is not None
+                                        ):
+                                            sds_closed_bar = (sds_latest_bar_time, sds_latest_close)
+                                        sds_latest_bar_time = bt
+                                        sds_latest_close = bc
+                                        state["live_price"] = bc
 
                                 # PSL AI study verisini işle (st1)
+                                table_updated = False
                                 st_data = payload_dict.get("st1")
-                                if not isinstance(st_data, dict):
-                                    continue
+                                if isinstance(st_data, dict):
+                                    state["indicator_detected"] = True
+                                    state["needs_login_hint"] = False
+                                    state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-                                state["indicator_detected"] = True
-                                state["needs_login_hint"] = False
-                                state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    ns_d = (st_data.get("ns") or {}).get("d")
+                                    table_lines = _extract_table_lines_from_ns(ns_d)
+                                    table_updated = bool(table_lines)
+                                    prev_parsed = state.get("parsed_table") or {}
+                                    parsed_table = dict(prev_parsed)
+                                    if table_lines:
+                                        parsed_table = parse_psl_table(table_lines)
+                                        if not parsed_table.get("last_sim_trade") and prev_parsed.get("last_sim_trade"):
+                                            parsed_table["last_sim_trade"] = prev_parsed["last_sim_trade"]
+                                            if parsed_table.get("plan_status") != "active":
+                                                base_txt = parsed_table.get("plan_status_text") or ""
+                                                parsed_table["plan_status_text"] = (
+                                                    f"{base_txt} · Son: {prev_parsed['last_sim_trade']}"
+                                                    if base_txt
+                                                    else prev_parsed["last_sim_trade"]
+                                                )
 
-                                ns_d = (st_data.get("ns") or {}).get("d")
-                                table_lines = _extract_table_lines_from_ns(ns_d)
-                                prev_parsed = state.get("parsed_table") or {}
-                                parsed_table = dict(prev_parsed)
-                                if table_lines:
-                                    parsed_table = parse_psl_table(table_lines)
-                                    if not parsed_table.get("last_sim_trade") and prev_parsed.get("last_sim_trade"):
-                                        parsed_table["last_sim_trade"] = prev_parsed["last_sim_trade"]
-                                        parsed_table["plan_status_text"] = prev_parsed["last_sim_trade"]
+                                    bars = st_data.get("st") or st_data.get("s") or []
+                                    for bar in bars:
+                                        v = bar.get("v") or []
+                                        if len(v) < 7:
+                                            continue
+                                        bar_t_raw = _clean_num(v[0])
+                                        if bar_t_raw is None:
+                                            continue
+                                        bar_t = int(bar_t_raw)
 
-                                bars = st_data.get("st") or st_data.get("s") or []
-                                for bar in bars:
-                                    v = bar.get("v") or []
-                                    if len(v) < 7:
-                                        continue
-                                    bar_t_raw = _clean_num(v[0])
-                                    if bar_t_raw is None:
-                                        continue
-                                    bar_t = int(bar_t_raw)
-
-                                    # Mum kapanışı kontrolü: yeni bar timestamp'i geldiyse önceki bar kapandı demektir
-                                    if (
-                                        study_ready
-                                        and latest_bar_time is not None
-                                        and bar_t > latest_bar_time
-                                        and latest_bar_plots is not None
-                                    ):
-                                        self._process_closed_bar(
-                                            sym,
-                                            state,
-                                            latest_bar_time,
-                                            latest_bar_plots,
-                                            fired_keys,
-                                        )
                                         if (
-                                            _is_triggered(self._plot(latest_bar_plots, 9))
-                                            or _is_triggered(self._plot(latest_bar_plots, 10))
+                                            study_ready
+                                            and latest_bar_time is not None
+                                            and bar_t > latest_bar_time
+                                            and latest_bar_plots is not None
                                         ):
-                                            last_entry_bar_time = latest_bar_time
+                                            self._process_closed_bar(
+                                                sym,
+                                                state,
+                                                latest_bar_time,
+                                                latest_bar_plots,
+                                                fired_keys,
+                                            )
+                                            if (
+                                                _is_triggered(self._plot(latest_bar_plots, 9))
+                                                or _is_triggered(self._plot(latest_bar_plots, 10))
+                                            ):
+                                                last_entry_bar_time = latest_bar_time
 
-                                    latest_bar_time = bar_t
-                                    latest_bar_plots = v
+                                        latest_bar_time = bar_t
+                                        latest_bar_plots = v
 
-                                    # Anlık (intrabar) olaylar: TP1-4 ve Likidasyon + Entry fallback
-                                    if study_ready:
-                                        self._process_intrabar_events(
-                                            sym,
-                                            state,
-                                            bar_t,
-                                            v,
-                                            fired_keys,
-                                            last_entry_bar_time,
-                                        )
+                                        if study_ready:
+                                            self._process_intrabar_events(
+                                                sym,
+                                                state,
+                                                bar_t,
+                                                v,
+                                                fired_keys,
+                                                last_entry_bar_time,
+                                            )
 
-                                if latest_bar_plots is not None:
-                                    self._sync_levels_from_plots(parsed_table, latest_bar_plots)
+                                    if latest_bar_plots is not None:
+                                        self._sync_levels_from_plots(parsed_table, latest_bar_plots)
 
-                                state["parsed_table"] = parsed_table
-                                self._sync_coins_status()
+                                    state["parsed_table"] = parsed_table
+
+                                if study_ready and (isinstance(st_data, dict) or isinstance(sds_data, dict)):
+                                    self._evaluate_live_table_and_price(
+                                        sym,
+                                        state,
+                                        state.get("parsed_table") or {},
+                                        sds_closed_bar,
+                                        latest_bar_plots,
+                                        sds_latest_bar_time,
+                                        table_updated=table_updated,
+                                    )
+                                    self._sync_coins_status()
 
             except asyncio.CancelledError:
                 break
@@ -755,8 +808,14 @@ class TradingViewPlaywrightWatcher:
     def _sync_levels_from_plots(self, parsed: dict[str, Any], v: list[Any]) -> None:
         """
         v[1]=Entry, v[2]=Stop, v[3]=TP1, v[4]=TP2, v[5]=TP3, v[6]=TP4
-        Grafik ortasındaki gerçek işlem plotlarını her zaman sol tablodan öncelikli tutar.
+        Tablo aktif veya tetik bekliyorsa tablo değerlerini korur; yalnızca tablo boşsa ('—')
+        son işlem plotlarını yedek olarak kullanır.
         """
+        if parsed.get("plan_status") in ("active", "waiting", "mismatch") and parsed.get("entry") is not None:
+            return
+        if parsed.get("entry") is not None:
+            return
+
         mapping = [(1, "entry"), (2, "sl"), (3, "tp1"), (4, "tp2"), (5, "tp3"), (6, "tp4")]
         any_level = False
         for idx, field in mapping:
@@ -768,6 +827,145 @@ class TradingViewPlaywrightWatcher:
             parsed["plan_side"] = "long" if parsed["tp1"] > parsed["entry"] else "short"
         if any_level:
             parsed["indicator_detected"] = True
+
+    def _evaluate_live_table_and_price(
+        self,
+        sym: str,
+        state: dict[str, Any],
+        parsed_table: dict[str, Any],
+        sds_closed_bar: Optional[tuple[int, float]],
+        latest_plots: Optional[list[Any]],
+        sds_bar_time: Optional[int],
+        table_updated: bool = False,
+    ) -> None:
+        """
+        study_completed sonrası TradingView st1.st boş geldiğinde tüm canlı işlemleri
+        st1.ns.d tablosu ve sds_1 canlı fiyat/mum kapanışı üzerinden yürütür.
+        """
+        plan_status = parsed_table.get("plan_status")
+        plan_side = parsed_table.get("plan_side")
+        entry = parsed_table.get("entry")
+        tp1 = parsed_table.get("tp1")
+        tp2 = parsed_table.get("tp2")
+        tp3 = parsed_table.get("tp3")
+        tp4 = parsed_table.get("tp4")
+        sl = parsed_table.get("sl")
+        checked_tps = parsed_table.get("checked_tps") or []
+        live_price = state.get("live_price")
+        bar_t = sds_bar_time or int(time.time())
+        plots = latest_plots or []
+
+        has_levels = all(v is not None and v > 0 for v in (entry, tp1, tp2, tp3, tp4, sl))
+
+        # 1. Açık İşlem Takibi
+        active = state.get("active_trade")
+        if active is not None:
+            a_side = active["side"]
+            tf_closes = _tf_close_pct_list(self.tv_interval)
+
+            # Tablo aktiften çıktıysa veya ters yöne aktif plan açtıysa kapat
+            if plan_status == "active" and plan_side in ("long", "short") and plan_side != a_side and has_levels:
+                self._emit_event(sym, "stop", a_side, live_price or active["sl"], active, bar_t, plots)
+                state["active_trade"] = None
+                state["non_active_streak"] = 0
+                active = None
+            elif table_updated and plan_status in ("waiting", "mismatch", "none", "stopped", "completed"):
+                state["non_active_streak"] = int(state.get("non_active_streak") or 0) + 1
+                if state["non_active_streak"] >= 2:
+                    self._emit_event(sym, "stop", a_side, live_price or active["sl"], active, bar_t, plots)
+                    state["active_trade"] = None
+                    state["non_active_streak"] = 0
+                    return
+            else:
+                state["non_active_streak"] = 0
+
+        active = state.get("active_trade")
+        if active is not None:
+            a_side = active["side"]
+            tf_closes = _tf_close_pct_list(self.tv_interval)
+
+            if plan_status == "active" and sl is not None and sl > 0:
+                active["sl"] = sl
+
+            # TP1 - TP4 anlık kontrol (✓ işareti veya fiyat teması)
+            for idx in range(1, 5):
+                tp_key = f"tp{idx}"
+                if tp_key in active["hit_tps"]:
+                    continue
+                tp_val = active[tp_key]
+                touched = tp_key in checked_tps
+                if not touched and live_price is not None and tp_val:
+                    touched = (
+                        (a_side == "long" and live_price >= tp_val)
+                        or (a_side == "short" and live_price <= tp_val)
+                    )
+                if touched:
+                    active["hit_tps"].append(tp_key)
+                    if idx == 1:
+                        active["sl"] = active["tp1"]
+                    elif idx == 2:
+                        active["sl"] = active["tp2"]
+                    elif idx == 3:
+                        active["sl"] = active["tp3"]
+
+                    pct_share = tf_closes[idx - 1]
+                    self._emit_event(
+                        sym,
+                        tp_key,
+                        a_side,
+                        live_price or tp_val,
+                        active,
+                        bar_t,
+                        plots,
+                        close_pct=pct_share,
+                        new_sl=active["sl"],
+                    )
+                    if idx == 4:
+                        state["active_trade"] = None
+                        return
+
+            # Mum kapanışı Stop kontrolü (sds_1 mum kapanışı)
+            if sds_closed_bar is not None:
+                closed_t, closed_p = sds_closed_bar
+                if closed_t * 1000 >= active["opened_candle_ms"]:
+                    stopped = (
+                        (a_side == "long" and closed_p <= active["sl"])
+                        or (a_side == "short" and closed_p >= active["sl"])
+                    )
+                    if stopped:
+                        self._emit_event(sym, "stop", a_side, closed_p, active, closed_t, plots)
+                        state["active_trade"] = None
+                        return
+
+        # 2. Yeni Giriş Kontrolü
+        if state.get("active_trade") is None and plan_status == "active" and plan_side in ("long", "short") and has_levels:
+            plan_sig = f"{sym}|{plan_side}|{entry}|{tp4}"
+            if plan_sig == state.get("last_entered_sig"):
+                return
+
+            if checked_tps:
+                # Bot açılmadan önce zaten TP almış devam eden eski pozisyona sonradan girme
+                state["last_entered_sig"] = plan_sig
+                logger.info("%s devam eden işlem (zaten TP almış: %s), yeni giriş açılmadı.", sym, checked_tps)
+                return
+
+            self._trade_seq += 1
+            plan = {
+                "trade_id": self._trade_seq,
+                "side": plan_side,
+                "entry": entry,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "tp4": tp4,
+                "sl": sl,
+                "hit_tps": [],
+                "opened_candle_ms": bar_t * 1000,
+            }
+            state["active_trade"] = plan
+            state["last_entered_sig"] = plan_sig
+            state["non_active_streak"] = 0
+            self._emit_event(sym, "entry", plan_side, live_price or entry, plan, bar_t, plots)
 
     def _process_closed_bar(
         self,
