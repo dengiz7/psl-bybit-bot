@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: psl-ai-bybit-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BYBIT_TESTNET
+        value: "true"
+      - key: ENABLE_PLAYWRIGHT
+        value: "true"
+      - key: ENABLE_IMAP
+        value: "false"
+      - key: MARGIN_USDT
+        value: "15"
+      - key: DEFAULT_LEVERAGE
+        value: "50"
+      - key: MAX_LEVERAGE
+        value: "50"
+      - key: AUTO_TF_LEVERAGE
+        value: "true"
+      - key: TV_SYMBOL
+        value: "BYBIT:PUMPFUNUSDT.P,BYBIT:BTCUSDT.P"
+      - key: TV_INTERVAL
+        value: "5"
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: TV_SESSIONID
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
