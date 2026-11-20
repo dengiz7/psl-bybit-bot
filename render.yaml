@@ -22,7 +22,7 @@ services:
       - key: AUTO_TF_LEVERAGE
         value: "true"
       - key: TV_SYMBOL
-        value: "BYBIT:PUMPFUNUSDT.P,BYBIT:BTCUSDT.P"
+        value: "BYBIT:PUMPFUNUSDT.P,BYBIT:WLDUSDT.P,BYBIT:1000PEPEUSDT.P,BYBIT:FILUSDT.P,BYBIT:SENTUSDT.P,BYBIT:ARBUSDT.P,BYBIT:TIAUSDT.P"
       - key: TV_INTERVAL
         value: "5"
       - key: BYBIT_API_KEY

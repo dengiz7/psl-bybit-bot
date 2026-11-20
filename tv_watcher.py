@@ -376,7 +376,7 @@ class TradingViewPlaywrightWatcher:
             norm = _to_tv_symbol(item)
             if norm not in seen_syms:
                 seen_syms.append(norm)
-        self.tv_symbols: list[str] = seen_syms[:6] or ["BYBIT:BTCUSDT.P"]
+        self.tv_symbols: list[str] = seen_syms[:15] or ["BYBIT:BTCUSDT.P"]
         self.tv_symbol = self.tv_symbols[0]
         self.tv_interval = _normalize_interval(tv_interval or "15")
         self.chart_url = chart_url.strip()
@@ -571,8 +571,8 @@ class TradingViewPlaywrightWatcher:
     async def _run_all_symbols(self, auth_token: str, study_args: dict[str, Any]) -> None:
         self._sync_coins_status(state_label=f"Canlı WebSocket izleniyor ({len(self.tv_symbols)} parite)")
         tasks = [
-            asyncio.create_task(self._watch_symbol_ws(sym, auth_token, study_args))
-            for sym in self.tv_symbols
+            asyncio.create_task(self._watch_symbol_ws(sym, auth_token, study_args, delay_sec=idx * 1.2))
+            for idx, sym in enumerate(self.tv_symbols)
         ]
         while not self._stop_event.is_set():
             if all(t.done() for t in tasks):
@@ -588,7 +588,10 @@ class TradingViewPlaywrightWatcher:
         sym: str,
         auth_token: str,
         study_args: dict[str, Any],
+        delay_sec: float = 0.0,
     ) -> None:
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
         state = self._coin_states[sym]
         headers = {
             "Origin": "https://www.tradingview.com",
