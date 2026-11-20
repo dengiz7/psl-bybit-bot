@@ -24,7 +24,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 import ccxt
-import httpx
+import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -135,16 +135,16 @@ def send_telegram(message: str) -> None:
         return
     url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        with httpx.Client(timeout=8.0) as client:
-            client.post(
-                url,
-                json={
-                    "chat_id": Config.TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
+        requests.post(
+            url,
+            json={
+                "chat_id": Config.TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=8.0,
+        )
     except Exception as exc:
         logger.warning("Telegram bildirimi gönderilemedi: %s", exc)
 
@@ -949,7 +949,7 @@ def _render_dashboard_html() -> str:
         login_banner = (
             "<div class='warn'>"
             "⚠️ TradingView grafikte PSL AI tablosu henüz okunamadı veya oturum çerezi gerekiyor. "
-            "Hugging Face Secrets kısmına <b>TV_SESSIONID</b> eklerseniz kendi kayıtlı grafiğiniz yüklenir."
+            "Render Environment Variables kısmına <b>TV_SESSIONID</b> eklerseniz indikatör otomatik bağlanır."
             "</div>"
         )
 
@@ -962,6 +962,14 @@ def _render_dashboard_html() -> str:
     coins_dict = status.get("coins") or {}
     if coins_dict:
         coin_cards_html = "".join(_render_coin_card(c, esc) for c in coins_dict.values())
+        panel_blocks = []
+        for sym, c in coins_dict.items():
+            raw_lines = (c.get("parsed_table") or {}).get("raw_lines") or []
+            lines_html = "<br>".join(esc(ln) for ln in raw_lines) if raw_lines else "Veri bekleniyor..."
+            panel_blocks.append(
+                f"<div class='panel-coin'><h3>{esc(sym)}</h3><div class='mono'>{lines_html}</div></div>"
+            )
+        live_panels_html = "".join(panel_blocks)
     else:
         fallback_coin = {
             "symbol": status.get("symbol") or Config.TV_SYMBOL,
@@ -973,6 +981,7 @@ def _render_dashboard_html() -> str:
             "last_update": status.get("last_update"),
         }
         coin_cards_html = _render_coin_card(fallback_coin, esc)
+        live_panels_html = "<div class='mono'>Veri bekleniyor...</div>"
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
@@ -993,8 +1002,12 @@ def _render_dashboard_html() -> str:
     .lbl {{ color: #8b949e; }}
     .val {{ font-weight: 600; text-align: right; }}
     .warn {{ background: #3b2608; border: 1px solid #9e6a03; color: #f0b429; padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }}
-    .shot-box {{ background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }}
-    .shot-box img {{ width: 100%; border-radius: 6px; border: 1px solid #30363d; display: block; }}
+    .shot-box {{ background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }}
+    .shot-box h2 {{ font-size: 15px; margin: 0 0 12px 0; color: #58a6ff; }}
+    .panel-coin {{ margin-bottom: 14px; border-top: 1px solid #21262d; padding-top: 10px; }}
+    .panel-coin:first-of-type {{ border-top: none; padding-top: 0; }}
+    .panel-coin h3 {{ font-size: 14px; margin: 0 0 6px 0; color: #3fb950; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; line-height: 1.55; color: #c9d1d9; background: #0d1117; padding: 10px 12px; border-radius: 6px; border: 1px solid #21262d; overflow-x: auto; }}
   </style>
 </head>
 <body>
@@ -1011,15 +1024,15 @@ def _render_dashboard_html() -> str:
         <div class="row"><span class="lbl">İşlem Başı Marjin</span><span class="val">{Config.MARGIN_USDT} USDT</span></div>
         <div class="row"><span class="lbl">Maks. Kaldıraç</span><span class="val">{Config.MAX_LEVERAGE}x</span></div>
         <div class="row"><span class="lbl">Otomatik Zaman Dilimi Kaldıracı</span><span class="val">{esc(tf_lev_text)}</span></div>
-        <div class="row"><span class="lbl">Bulut Tarayıcı</span><span class="val">{'Aktif' if Config.ENABLE_PLAYWRIGHT else 'Kapalı'} ({esc(status.get('state'))})</span></div>
+        <div class="row"><span class="lbl">TradingView Akışı</span><span class="val">{'Aktif' if Config.ENABLE_PLAYWRIGHT else 'Kapalı'} ({esc(status.get('state'))})</span></div>
         <div class="row"><span class="lbl">Mail (IMAP)</span><span class="val">{'Aktif' if Config.ENABLE_IMAP else 'Kapalı'}</span></div>
       </div>
       {coin_cards_html}
     </div>
 
     <div class="shot-box">
-      <h2>🖥️ Bulut Tarayıcı Canlı Ekranı</h2>
-      <img id="tvShot" src="/screenshot?t={int(time.time())}" alt="TradingView Canlı Ekran Görüntüsü (Henüz hazırlanıyor...)" />
+      <h2>📋 Canlı PSL AI Paneli & Piyasa Yorumu (TradingView WebSocket)</h2>
+      {live_panels_html}
     </div>
   </div>
 

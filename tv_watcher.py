@@ -19,7 +19,7 @@ import time
 from typing import Any, Callable, Optional
 
 import aiohttp
-import httpx
+import requests
 
 logger = logging.getLogger("psl-tv-watcher")
 
@@ -145,6 +145,16 @@ def _extract_first_price(line: str, label_pattern: str) -> Optional[float]:
     return None
 
 
+def _tf_close_pct_list(interval: str) -> list[int]:
+    """PSL AI zaman dilimine özel TP1-TP4 kapanış yüzdelerini döndürür."""
+    norm = _normalize_interval(interval)
+    if norm == "5":
+        return [0, 0, 50, 50]
+    if norm in ("1", "15", "60", "240"):
+        return [0, 0, 0, 100]
+    return [25, 25, 25, 25]
+
+
 def parse_psl_table(lines: list[str]) -> dict[str, Any]:
     """TradingView tablo hücrelerinden PSL AI v2.1 panel verilerini ayıklar."""
     result: dict[str, Any] = {
@@ -153,6 +163,7 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
         "plan_side": "",
         "plan_status": "unknown",
         "plan_status_text": "",
+        "last_sim_trade": "",
         "entry": None,
         "tp1": None,
         "tp2": None,
@@ -174,6 +185,8 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
             for verdict in (
                 "ZAYIF AL",
                 "ZAYIF SAT",
+                "HAFİF AL",
+                "HAFİF SAT",
                 "WEAK BUY",
                 "WEAK SELL",
                 "NÖTR",
@@ -212,6 +225,22 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
             elif any(w in header_window for w in ("GEÇERSİZ OLDU", "STOPPED", "KAPANDI", "CLOSED")):
                 result["plan_status"] = "stopped"
                 result["plan_status_text"] = "KAPANDI"
+            elif "—" in header_window or "| -" in header_window:
+                result["plan_status"] = "none"
+                result["plan_status_text"] = "Plan Bekleniyor (—)"
+
+        if not result["last_sim_trade"]:
+            sim_match = re.match(
+                r"^(\d+)\s*\|\s*(ALIŞ|SATIŞ|LONG|SHORT)\s*\|\s*[^|]+\|\s*([^|]+)\|\s*([^|]+)",
+                uline,
+            )
+            if sim_match:
+                t_num, t_side, t_res, t_pnl = sim_match.groups()
+                result["last_sim_trade"] = f"#{t_num.strip()} {t_side.strip()} · {t_res.strip()} ({t_pnl.strip()})"
+
+        # Yorum (▍) ve simülasyon geçmişi satırlarından sahte GİRİŞ rakamı okuma
+        if uline.startswith("▍") or uline.startswith("# |") or "SONUÇLANAN" in uline:
+            continue
 
         if result["entry"] is None:
             val = _extract_first_price(uline, r"\b(?:GİRİŞ|ENTRY)\b")
@@ -230,6 +259,9 @@ def parse_psl_table(lines: list[str]) -> dict[str, Any]:
             if val is not None:
                 result["sl"] = val
 
+    if result["last_sim_trade"]:
+        result["plan_status_text"] = result["last_sim_trade"]
+    result["raw_lines"] = lines[:45]
     return result
 
 
@@ -283,23 +315,26 @@ def _is_triggered(val: Any) -> bool:
 
 def _extract_table_lines_from_ns(ns_d: Any) -> list[str]:
     """TradingView `st1.ns.d` JSON verisindeki dwgtablecells metinlerini satırlara döker."""
-    if not isinstance(ns_d, str) or "tableCells" not in ns_d and "dwgtablecells" not in ns_d and "GİRİŞ" not in ns_d:
+    if not isinstance(ns_d, str) or ("tableCells" not in ns_d and "dwgtablecells" not in ns_d and "GİRİŞ" not in ns_d):
         return []
     try:
         parsed = json.loads(ns_d)
     except Exception:
         return []
 
-    rows_map: dict[int, list[tuple[int, str]]] = {}
+    rows_map: dict[tuple[int, int], list[tuple[int, str]]] = {}
 
     def _walk(node: Any) -> None:
         if isinstance(node, dict):
-            if "r" in node and "c" in node and isinstance(node.get("t"), str):
+            row_val = node.get("row", node.get("r"))
+            col_val = node.get("col", node.get("c"))
+            if row_val is not None and col_val is not None and isinstance(node.get("t"), str):
                 txt = node["t"].replace("\n", " ").strip()
                 if txt:
-                    r_idx = int(node["r"])
-                    c_idx = int(node["c"])
-                    rows_map.setdefault(r_idx, []).append((c_idx, txt))
+                    tid = int(node.get("tid", 1))
+                    r_idx = int(row_val)
+                    c_idx = int(col_val)
+                    rows_map.setdefault((tid, r_idx), []).append((c_idx, txt))
             for v in node.values():
                 _walk(v)
         elif isinstance(node, list):
@@ -308,8 +343,8 @@ def _extract_table_lines_from_ns(ns_d: Any) -> list[str]:
 
     _walk(parsed)
     lines: list[str] = []
-    for r_idx in sorted(rows_map.keys()):
-        cols = [t for _, t in sorted(rows_map[r_idx], key=lambda item: item[0])]
+    for key in sorted(rows_map.keys()):
+        cols = [t for _, t in sorted(rows_map[key], key=lambda item: item[0])]
         if cols:
             lines.append(" | ".join(cols))
     return lines
@@ -465,43 +500,37 @@ class TradingViewPlaywrightWatcher:
             "Cookie": "; ".join(cookie_parts),
         }
         try:
-            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-                resp = client.get(TV_CHART_PAGE_URL, headers=headers)
-                match = re.search(r'"auth_token"\s*:\s*"([^"]+)"', resp.text)
-                if match:
-                    token = match.group(1)
-                    if token != "unauthorized_user_token":
-                        return token
+            resp = requests.get(TV_CHART_PAGE_URL, headers=headers, timeout=15)
+            match = re.search(r'"auth_token"\s*:\s*"([^"]+)"', resp.text)
+            if match:
+                token = match.group(1)
+                if token != "unauthorized_user_token":
+                    return token
         except Exception as exc:
             logger.error("TradingView auth_token alınırken hata: %s", exc)
         return None
 
     def _fetch_psl_study_args(self) -> dict[str, Any]:
         """TradingView pine-facade üzerinden güncel PSL AI v2.1 meta verilerini indirir."""
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.get(
-                PSL_TRANSLATE_URL,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        resp = requests.get(
+            PSL_TRANSLATE_URL,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         meta = (data.get("result") or {}).get("metaInfo") or {}
         inputs = (meta.get("defaults") or {}).get("inputs") or {}
-        study_args: dict[str, Any] = {
+        return {
             "text": inputs["text"],
             "pineId": meta["scriptIdPart"],
             "pineVersion": (meta.get("pine") or {}).get("version", "3.0"),
+            "in_27": {"v": 100, "f": True, "t": "integer"},
+            "in_28": {"v": 15, "f": True, "t": "integer"},
+            "in_29": {"v": 50, "f": True, "t": "integer"},
+            "in_39": {"v": True, "f": True, "t": "bool"},
         }
-        for inp in meta.get("inputs", []):
-            iid = inp.get("id")
-            if iid and iid not in ("text", "pineId", "pineVersion") and iid in inputs:
-                study_args[iid] = {
-                    "v": inputs[iid],
-                    "f": True,
-                    "t": inp.get("type", "text"),
-                }
-        return study_args
 
     def _run_loop(self) -> None:
         logger.info("TradingView WebSocket izleyicisi başlatılıyor: %s", ", ".join(self.tv_symbols))
@@ -584,7 +613,7 @@ class TradingViewPlaywrightWatcher:
                         await ws.send_str(_pack_tv("chart_create_session", [chart_session, ""]))
                         sym_cfg = "=" + json.dumps({"symbol": sym, "adjustment": "splits"})
                         await ws.send_str(_pack_tv("resolve_symbol", [chart_session, "sds_sym_1", sym_cfg]))
-                        await ws.send_str(_pack_tv("create_series", [chart_session, "sds_1", "s1", "sds_sym_1", self.tv_interval, 300, ""]))
+                        await ws.send_str(_pack_tv("create_series", [chart_session, "sds_1", "s1", "sds_sym_1", self.tv_interval, 3000, ""]))
                         await ws.send_str(_pack_tv("create_study", [chart_session, "st1", "st1", "sds_1", "Script@tv-scripting-101!", study_args]))
                         logger.info("TradingView WebSocket başlatıldı: %s (%s)", sym, self.tv_interval)
 
@@ -652,9 +681,13 @@ class TradingViewPlaywrightWatcher:
 
                                 ns_d = (st_data.get("ns") or {}).get("d")
                                 table_lines = _extract_table_lines_from_ns(ns_d)
-                                parsed_table = dict(state.get("parsed_table") or {})
+                                prev_parsed = state.get("parsed_table") or {}
+                                parsed_table = dict(prev_parsed)
                                 if table_lines:
                                     parsed_table = parse_psl_table(table_lines)
+                                    if not parsed_table.get("last_sim_trade") and prev_parsed.get("last_sim_trade"):
+                                        parsed_table["last_sim_trade"] = prev_parsed["last_sim_trade"]
+                                        parsed_table["plan_status_text"] = prev_parsed["last_sim_trade"]
 
                                 bars = st_data.get("st") or st_data.get("s") or []
                                 for bar in bars:
@@ -689,9 +722,6 @@ class TradingViewPlaywrightWatcher:
                                     latest_bar_time = bar_t
                                     latest_bar_plots = v
 
-                                    # Tablo / seviye değerlerini plotlardan da senkronize et
-                                    self._sync_levels_from_plots(parsed_table, v)
-
                                     # Anlık (intrabar) olaylar: TP1-4 ve Likidasyon + Entry fallback
                                     if study_ready:
                                         self._process_intrabar_events(
@@ -702,6 +732,9 @@ class TradingViewPlaywrightWatcher:
                                             fired_keys,
                                             last_entry_bar_time,
                                         )
+
+                                if latest_bar_plots is not None:
+                                    self._sync_levels_from_plots(parsed_table, latest_bar_plots)
 
                                 state["parsed_table"] = parsed_table
                                 self._sync_coins_status()
@@ -719,6 +752,7 @@ class TradingViewPlaywrightWatcher:
     def _sync_levels_from_plots(self, parsed: dict[str, Any], v: list[Any]) -> None:
         """
         v[1]=Entry, v[2]=Stop, v[3]=TP1, v[4]=TP2, v[5]=TP3, v[6]=TP4
+        Grafik ortasındaki gerçek işlem plotlarını her zaman sol tablodan öncelikli tutar.
         """
         mapping = [(1, "entry"), (2, "sl"), (3, "tp1"), (4, "tp2"), (5, "tp3"), (6, "tp4")]
         any_level = False
@@ -727,6 +761,8 @@ class TradingViewPlaywrightWatcher:
             if num is not None and num > 0:
                 parsed[field] = num
                 any_level = True
+        if parsed.get("entry") and parsed.get("tp1"):
+            parsed["plan_side"] = "long" if parsed["tp1"] > parsed["entry"] else "short"
         if any_level:
             parsed["indicator_detected"] = True
 
@@ -775,6 +811,7 @@ class TradingViewPlaywrightWatcher:
             return
 
         a_side = active["side"]
+        tf_closes = _tf_close_pct_list(self.tv_interval)
         for tp_idx, plot_idx in ((1, 12), (2, 13), (3, 14), (4, 15)):
             if _is_triggered(self._plot(v, plot_idx)):
                 tp_key = f"tp{tp_idx}"
@@ -785,7 +822,8 @@ class TradingViewPlaywrightWatcher:
                         active["hit_tps"].append(tp_key)
                     tp_price = _clean_num(self._plot(v, tp_idx + 2)) or state.get("live_price") or 0.0
                     new_sl = _clean_num(self._plot(v, 2))
-                    self._emit_event(sym, tp_key, a_side, tp_price, active, bar_t, v, close_pct=25, new_sl=new_sl)
+                    pct_share = tf_closes[tp_idx - 1]
+                    self._emit_event(sym, tp_key, a_side, tp_price, active, bar_t, v, close_pct=pct_share, new_sl=new_sl)
                     if tp_idx == 4:
                         state["active_trade"] = None
                         return
@@ -862,13 +900,16 @@ class TradingViewPlaywrightWatcher:
                     "tp4": plan["tp4"],
                     "sl": plan["sl"],
                     "leverage": self.default_leverage,
-                    "close_pct": [25, 25, 25, 25],
+                    "close_pct": _tf_close_pct_list(self.tv_interval),
                 }
             )
         elif event.startswith("tp"):
+            tp_num = int(event[-1])
+            default_pct = _tf_close_pct_list(self.tv_interval)[tp_num - 1]
+            pct_val = 100 if event == "tp4" else (default_pct if close_pct is None else close_pct)
             payload.update(
                 {
-                    "close_pct": 100 if event == "tp4" else (close_pct or 25),
+                    "close_pct": pct_val,
                     "sl": None if event == "tp4" else (new_sl or plan["sl"]),
                 }
             )
