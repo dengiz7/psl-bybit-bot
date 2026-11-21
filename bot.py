@@ -341,11 +341,16 @@ class BybitTrader:
             logger.error("Bybit kimlik doğrulaması başarısız: %s", last_err)
             return
 
-        try:
-            self._exchange.load_markets()
-            logger.info("Bybit market bilgileri başarıyla yüklendi.")
-        except Exception as exc:
-            logger.error("Bybit marketleri yüklenemedi: %s", exc)
+        def _load_markets_bg() -> None:
+            try:
+                with self._lock:
+                    if self._exchange is not None:
+                        self._exchange.load_markets()
+                logger.info("Bybit market bilgileri başarıyla yüklendi.")
+            except Exception as exc:
+                logger.error("Bybit marketleri yüklenemedi: %s", exc)
+
+        threading.Thread(target=_load_markets_bg, daemon=True, name="bybit-markets-loader").start()
 
     def _build_client(self, mode_key: str) -> ccxt.bybit:
         client = ccxt.bybit(
@@ -1102,17 +1107,12 @@ def dashboard() -> str:
 
 
 @app.get("/health")
+@app.get("/ping")
 def health_check() -> dict[str, Any]:
-    """UptimeRobot gibi servislerin botu uyanık tutması için sağlık kontrolü."""
+    """cron-job.org ve UptimeRobot için hafif (~35 byte) sağlık kontrolü."""
     return {
         "status": "ok",
-        "mode": _bot_mode_label(),
-        "bybit_connected": bool(trader and trader.connected),
-        "usdt_balance": trader.usdt_balance if trader else None,
-        "playwright_enabled": Config.ENABLE_PLAYWRIGHT,
-        "playwright_status": tv_watcher.get_status() if tv_watcher else None,
-        "imap_enabled": Config.ENABLE_IMAP,
-        "imap_alive": bool(_imap_thread and _imap_thread.is_alive()),
+        "bybit": bool(trader and trader.connected),
     }
 
 
