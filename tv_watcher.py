@@ -146,13 +146,8 @@ def _extract_first_price(line: str, label_pattern: str) -> Optional[float]:
 
 
 def _tf_close_pct_list(interval: str) -> list[int]:
-    """PSL AI zaman dilimine özel TP1-TP4 kapanış yüzdelerini döndürür."""
-    norm = _normalize_interval(interval)
-    if norm == "5":
-        return [0, 0, 50, 50]
-    if norm in ("1", "15", "60", "240"):
-        return [0, 0, 0, 100]
-    return [25, 25, 25, 25]
+    """TP1'de %55 kâr alıp TP2/TP3/TP4'te %15'er kapatarak kârı borsada garantiye alır."""
+    return [55, 15, 15, 15]
 
 
 def parse_psl_table(lines: list[str]) -> dict[str, Any]:
@@ -884,7 +879,7 @@ class TradingViewPlaywrightWatcher:
             a_side = active["side"]
             tf_closes = _tf_close_pct_list(self.tv_interval)
 
-            if plan_status == "active" and sl is not None and sl > 0:
+            if not active["hit_tps"] and plan_status == "active" and sl is not None and sl > 0:
                 active["sl"] = sl
 
             # TP1 - TP4 anlık kontrol (✓ işareti veya fiyat teması)
@@ -902,11 +897,11 @@ class TradingViewPlaywrightWatcher:
                 if touched:
                     active["hit_tps"].append(tp_key)
                     if idx == 1:
-                        active["sl"] = active["tp1"]
+                        active["sl"] = active["entry"]
                     elif idx == 2:
-                        active["sl"] = active["tp2"]
+                        active["sl"] = active["tp1"]
                     elif idx == 3:
-                        active["sl"] = active["tp3"]
+                        active["sl"] = active["tp2"]
 
                     pct_share = tf_closes[idx - 1]
                     self._emit_event(
@@ -923,6 +918,18 @@ class TradingViewPlaywrightWatcher:
                     if idx == 4:
                         state["active_trade"] = None
                         return
+
+            # TP1+ alındıktan sonra iz süren stopu canlı fiyatta anlık koru
+            if active["hit_tps"] and live_price is not None and active.get("sl"):
+                trail_sl = active["sl"]
+                trail_hit = (
+                    (a_side == "long" and live_price <= trail_sl)
+                    or (a_side == "short" and live_price >= trail_sl)
+                )
+                if trail_hit:
+                    self._emit_event(sym, "stop", a_side, live_price, active, bar_t, plots)
+                    state["active_trade"] = None
+                    return
 
             # Mum kapanışı Stop kontrolü (sds_1 mum kapanışı)
             if sds_closed_bar is not None:

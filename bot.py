@@ -479,6 +479,38 @@ class BybitTrader:
             params=params,
         )
 
+    def _set_exchange_trailing_sl(self, symbol: str, side: str, sl_price: float) -> bool:
+        """
+        Bybit sunucu tarafında gerçek Stop-Loss (iz süren stop) yerleştirir.
+        Fiyat SL seviyesini zaten geçmişse False döner.
+        """
+        if Config.DRY_RUN or self._exchange is None or sl_price <= 0:
+            return True
+        try:
+            if not self._exchange.markets:
+                self._exchange.load_markets()
+            market = self._exchange.market(symbol)
+            sl_str = str(self._exchange.price_to_precision(symbol, sl_price))
+            self._exchange.private_post_v5_position_trading_stop(
+                {
+                    "category": "linear",
+                    "symbol": market["id"],
+                    "stopLoss": sl_str,
+                    "slTriggerBy": "LastPrice",
+                    "tpslMode": "Full",
+                    "positionIdx": self._position_idx(side),
+                }
+            )
+            logger.info("%s için Bybit sunucu tarafı SL ayarlandı: %s", symbol, sl_str)
+            return True
+        except Exception as exc:
+            err_txt = str(exc).lower()
+            if any(k in err_txt for k in ("10001", "should be", "greater", "lower", "less", "higher")):
+                logger.warning("%s SL fiyatı (%s) piyasa tarafından zaten geçilmiş: %s", symbol, sl_price, exc)
+                return False
+            logger.warning("%s Bybit SL güncelleme uyarısı: %s", symbol, exc)
+            return True
+
     def execute_signal(self, payload: dict[str, Any], source: str, latency_info: str) -> None:
         event = str(payload.get("event", "")).lower().strip()
         raw_symbol = str(payload.get("symbol", "")).strip()
@@ -690,18 +722,36 @@ class BybitTrader:
             reduce_only=True,
         )
 
+        remaining = max(0.0, open_qty - close_qty)
         if symbol in self._active_trades:
-            remaining = max(0.0, open_qty - close_qty)
             self._active_trades[symbol]["remaining_qty"] = remaining
             self._active_trades[symbol]["sl"] = new_sl
             if event == "tp4" or remaining <= 0:
                 self._active_trades.pop(symbol, None)
 
+        sl_note = f"{new_sl}"
+        if event != "tp4" and remaining > 0 and new_sl:
+            sl_ok = self._set_exchange_trailing_sl(symbol, side, float(new_sl))
+            if not sl_ok:
+                rem_live = self._get_open_position(symbol, side)
+                if rem_live > 0:
+                    self._place_market_order(
+                        symbol=symbol,
+                        order_side=close_order_side,
+                        amount=rem_live,
+                        position_side=side,
+                        reduce_only=True,
+                    )
+                self._active_trades.pop(symbol, None)
+                sl_note = f"{new_sl} (Fiyat döndüğü için kalan pozisyon kârda kapatıldı)"
+            else:
+                sl_note = f"{new_sl} (Bybit borsasına SL konuldu)"
+
         msg = (
             f"💰 <b>PSL AI {event.upper()} KÂR ALINDI</b>\n"
             f"• Parite: <code>{symbol}</code> ({side.upper()})\n"
             f"• Kapatılan Miktar: <code>{close_qty}</code> (%{pct:.0f})\n"
-            f"• Güncel SL: <code>{new_sl}</code>\n"
+            f"• Güncel SL: <code>{sl_note}</code>\n"
             f"• Kaynak: {source} | {latency_info} | Order: <code>{order.get('id')}</code>"
         )
         logger.info("%s %s kapatıldı | qty=%s | %s", symbol, event.upper(), close_qty, latency_info)
