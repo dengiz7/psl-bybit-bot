@@ -121,32 +121,213 @@ class Config:
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-    # Sunucu (Hugging Face Spaces varsayılan portu: 7860)
+    # Sunucu (Hugging Face Spaces / Render)
     HOST: str = os.getenv("HOST", "0.0.0.0").strip()
     PORT: int = _env_int("PORT", 7860)
+    PUBLIC_URL: str = (
+        os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+    ).strip().rstrip("/")
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı Araçlar (Telegram, Sembol Normalizasyonu, JSON Ayıklama)
+# Yardımcı Araçlar (Telegram, Linkler, Biçimlendirme, Sembol Normalizasyonu)
 # ---------------------------------------------------------------------------
-def send_telegram(message: str) -> None:
+def send_telegram(
+    message: str,
+    reply_markup: Optional[dict[str, Any]] = None,
+) -> bool:
     """Telegram üzerinden anlık işlem ve hata bildirimi gönderir."""
     if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
-        return
+        return False
     url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload: dict[str, Any] = {
+        "chat_id": Config.TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        requests.post(
-            url,
-            json={
-                "chat_id": Config.TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=8.0,
-        )
+        resp = requests.post(url, json=payload, timeout=8.0)
+        if not resp.ok:
+            logger.warning("Telegram API hatası (%s): %s", resp.status_code, resp.text[:200])
+            return False
+        return True
     except Exception as exc:
         logger.warning("Telegram bildirimi gönderilemedi: %s", exc)
+        return False
+
+
+def _symbol_to_ticker(symbol: str) -> str:
+    """Herhangi bir sembol formatını temiz Bybit ticker'ına (örn: PUMPFUNUSDT) dönüştürür."""
+    sym = str(symbol or "").strip().upper()
+    if ":" in sym:
+        # CCXT formatındaysa (PUMPFUN/USDT:USDT) sol kısmı, TV formatındaysa (BYBIT:PUMPFUNUSDT.P) sağ kısmı al
+        sym = sym.split(":", 1)[0] if "/" in sym else sym.split(":", 1)[-1]
+    if sym.endswith((".P", ".PS")):
+        sym = sym.rsplit(".", 1)[0]
+    elif sym.endswith("PERP") and len(sym) > 4:
+        sym = sym[:-4]
+    return sym.replace("/", "")
+
+
+def _ticker_base(symbol: str) -> str:
+    """Ticker'ın sadece coin adını döndürür (örn: PUMPFUNUSDT -> PUMPFUN)."""
+    ticker = _symbol_to_ticker(symbol)
+    for quote in ("USDT", "USDC", "USD"):
+        if ticker.endswith(quote) and len(ticker) > len(quote):
+            return ticker[: -len(quote)]
+    return ticker
+
+
+def _format_tf_label(tf: Optional[str]) -> str:
+    """TradingView zaman dilimini Türkçe okunabilir etikete çevirir."""
+    raw = str(tf or Config.TV_INTERVAL or "5").strip().upper()
+    mapping = {
+        "1": "1 dk",
+        "1M": "1 dk",
+        "3": "3 dk",
+        "5": "5 dk",
+        "5M": "5 dk",
+        "15": "15 dk",
+        "15M": "15 dk",
+        "30": "30 dk",
+        "30M": "30 dk",
+        "45": "45 dk",
+        "60": "1 saat",
+        "1H": "1 saat",
+        "120": "2 saat",
+        "2H": "2 saat",
+        "240": "4 saat",
+        "4H": "4 saat",
+        "D": "1 gün",
+        "1D": "1 gün",
+        "W": "1 hafta",
+        "1W": "1 hafta",
+    }
+    if raw in mapping:
+        return mapping[raw]
+    return f"{raw} dk" if raw.isdigit() else raw
+
+
+def _fmt_price(val: Any) -> str:
+    """Fiyatları bilimsel gösterim olmadan, okunaklı biçimde formatlar."""
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return "—"
+    if num <= 0:
+        return "—"
+    if num >= 1000:
+        s = f"{num:.2f}"
+    elif num >= 1:
+        s = f"{num:.4f}"
+    elif num >= 0.01:
+        s = f"{num:.6f}"
+    else:
+        s = f"{num:.8f}"
+    return s.rstrip("0").rstrip(".") or "0"
+
+
+def _fmt_qty(val: Any) -> str:
+    """Kontrat/coin miktarını binlik ayırıcı ve temiz ondalıkla formatlar."""
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return "—"
+    if num <= 0:
+        return "0"
+    if num >= 100 and abs(num - round(num)) < 1e-6:
+        return f"{int(round(num)):,}"
+    if num >= 1000:
+        return f"{num:,.2f}".rstrip("0").rstrip(".")
+    if num >= 1:
+        return f"{num:.4f}".rstrip("0").rstrip(".")
+    return f"{num:.6f}".rstrip("0").rstrip(".")
+
+
+def _pct_diff_str(entry: float, target: Any, side: str) -> str:
+    """Giriş fiyatına göre hedef/SL yüzdesel mesafesini (+ / -) döndürür."""
+    try:
+        e = float(entry)
+        t = float(target)
+    except (TypeError, ValueError):
+        return ""
+    if e <= 0 or t <= 0:
+        return ""
+    pct = ((t - e) / e) * 100.0 if side == "long" else ((e - t) / e) * 100.0
+    return f" ({pct:+.2f}%)"
+
+
+def _build_trade_urls(
+    symbol: str,
+    tf: Optional[str] = None,
+    is_testnet: bool = False,
+) -> tuple[str, str]:
+    """İlgili parite için doğrudan TradingView grafik ve Bybit Futures linklerini üretir."""
+    ticker = _symbol_to_ticker(symbol)
+    raw_tf = str(tf or Config.TV_INTERVAL or "5").strip().upper()
+    tv_tf_map = {
+        "1M": "1",
+        "3M": "3",
+        "5M": "5",
+        "15M": "15",
+        "30M": "30",
+        "45M": "45",
+        "1H": "60",
+        "2H": "120",
+        "4H": "240",
+        "1D": "D",
+        "1W": "W",
+    }
+    interval = tv_tf_map.get(raw_tf, str(tf or Config.TV_INTERVAL or "5").strip())
+    tv_url = f"https://tr.tradingview.com/chart/?symbol=BYBIT%3A{ticker}.P&interval={interval}"
+    bybit_host = "testnet.bybit.com" if is_testnet else "www.bybit.com"
+    bybit_url = f"https://{bybit_host}/trade/usdt/{ticker}"
+    return tv_url, bybit_url
+
+
+def _build_trade_buttons(
+    symbol: str,
+    tf: Optional[str] = None,
+    is_testnet: bool = False,
+) -> dict[str, Any]:
+    """Telegram mesajı altına eklenecek TradingView ve Bybit satır içi butonlarını döndürür."""
+    tv_url, bybit_url = _build_trade_urls(symbol, tf=tf, is_testnet=is_testnet)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📈 TradingView Grafik", "url": tv_url},
+                {"text": "⚡ Bybit'te Aç", "url": bybit_url},
+            ]
+        ]
+    }
+
+
+def _format_close_metrics(
+    entry_px: float,
+    exit_px: float,
+    qty: float,
+    side: str,
+    pnl_label: str,
+    bal: Optional[float],
+) -> str:
+    """Kapanış/TP kartları için fiyat hareketi, tahmini K/Z ve bakiye satırlarını üretir."""
+    lines: list[str] = []
+    if entry_px > 0 and exit_px > 0:
+        diff_str = _pct_diff_str(entry_px, exit_px, side)
+        lines.append(
+            f"💵 <b>Fiyat:</b> <code>{_fmt_price(entry_px)}</code> → <code>{_fmt_price(exit_px)}</code>{diff_str}"
+        )
+        est_pnl = (exit_px - entry_px) * qty if side == "long" else (entry_px - exit_px) * qty
+        pnl_icon = "💚" if est_pnl >= 0 else "❤️"
+        lines.append(f"{pnl_icon} <b>{pnl_label}:</b> <code>{est_pnl:+.2f} USDT</code>")
+    elif exit_px > 0:
+        lines.append(f"💵 <b>Çıkış Fiyatı:</b> <code>{_fmt_price(exit_px)}</code>")
+    if bal is not None:
+        lines.append(f"💼 <b>Güncel Bakiye:</b> <code>{bal:.2f} USDT</code>")
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def normalize_symbol(raw_symbol: str) -> str:
@@ -567,6 +748,19 @@ class BybitTrader:
                 lev = min(lev, int(float(max_mkt)))
         return max(1, lev)
 
+    def _short_mode_tag(self) -> str:
+        """Telegram başlıkları için kısa hesap modu etiketi üretir."""
+        if Config.DRY_RUN:
+            return "DRY-RUN"
+        mode_upper = (self.account_mode_name or "").upper()
+        if "DEMO" in mode_upper:
+            return "DEMO"
+        if "TESTNET" in mode_upper:
+            return "TESTNET"
+        if "CANLI" in mode_upper:
+            return "CANLI"
+        return "TESTNET" if Config.BYBIT_TESTNET else "CANLI"
+
     def _handle_entry(
         self,
         payload: dict[str, Any],
@@ -635,24 +829,63 @@ class BybitTrader:
         if not isinstance(close_pct, list) or len(close_pct) < 4:
             close_pct = [25, 25, 25, 25]
 
+        tf_val = str(payload.get("tf") or Config.TV_INTERVAL)
+        entry_px = float(order.get("average") or order.get("price") or ref_price or signal_price or 0.0)
+
         self._active_trades[symbol] = {
             "trade_id": trade_id,
             "side": side,
+            "tf": tf_val,
+            "leverage": leverage,
+            "margin_usdt": Config.MARGIN_USDT,
             "initial_qty": qty,
             "remaining_qty": qty,
             "close_pct": close_pct,
-            "entry_price": ref_price,
+            "entry_price": entry_px,
+            "tp1": payload.get("tp1"),
+            "tp2": payload.get("tp2"),
+            "tp3": payload.get("tp3"),
+            "tp4": payload.get("tp4"),
             "sl": payload.get("sl"),
         }
 
-        mode_tag = "DRY-RUN" if Config.DRY_RUN else ("TESTNET" if Config.BYBIT_TESTNET else "CANLI")
+        mode_tag = self._short_mode_tag()
+        ticker = _symbol_to_ticker(symbol)
+        tf_label = _format_tf_label(tf_val)
+        side_header = (
+            f"🟢 <b>YENİ LONG İŞLEM AÇILDI</b> · <code>[{mode_tag}]</code>"
+            if side == "long"
+            else f"🔴 <b>YENİ SHORT İŞLEM AÇILDI</b> · <code>[{mode_tag}]</code>"
+        )
+        sl_val = payload.get("sl")
+        sl_pct = _pct_diff_str(entry_px, sl_val, side)
+
+        tp_lines: list[str] = []
+        for i in range(1, 5):
+            tp_val = payload.get(f"tp{i}")
+            tp_pct_share = int(float(close_pct[i - 1])) if i - 1 < len(close_pct) else 25
+            prefix = "└" if i == 4 else "├"
+            tp_diff = _pct_diff_str(entry_px, tp_val, side)
+            tp_lines.append(
+                f"{prefix} <b>TP{i} (%{tp_pct_share}):</b> <code>{_fmt_price(tp_val)}</code>{tp_diff}"
+            )
+
         msg = (
-            f"🚀 <b>PSL AI YENİ İŞLEM [{mode_tag}]</b>\n"
-            f"• Parite: <code>{symbol}</code> ({side.upper()} {leverage}x)\n"
-            f"• Miktar: <code>{qty}</code> (~{notional:.2f} USDT hacim)\n"
-            f"• Sinyal Fiyatı: <code>{signal_price}</code> | İndikatör SL: <code>{payload.get('sl')}</code>\n"
-            f"• Hedefler: TP1={payload.get('tp1')} | TP2={payload.get('tp2')} | TP3={payload.get('tp3')} | TP4={payload.get('tp4')}\n"
-            f"• Kaynak: {source} | {latency_info} | Order: <code>{order.get('id')}</code>"
+            f"{side_header}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Parite:</b> <code>#{ticker}</code> · <b>{html.escape(tf_label)}</b>\n"
+            f"⚡ <b>Kaldıraç:</b> <code>{leverage}x</code> · <b>Marjin:</b> <code>{Config.MARGIN_USDT:g} USDT</code> (~{notional:.0f} USDT)\n"
+            f"📦 <b>Miktar:</b> <code>{_fmt_qty(qty)}</code>\n\n"
+            f"📍 <b>Giriş Fiyatı:</b> <code>{_fmt_price(entry_px)}</code>\n"
+            f"🛑 <b>Stop Loss (SL):</b> <code>{_fmt_price(sl_val)}</code>{sl_pct}\n\n"
+            f"🎯 <b>Kâr Hedefleri</b>\n"
+            + "\n".join(tp_lines)
+            + f"\n\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
+        )
+        buttons = _build_trade_buttons(
+            symbol,
+            tf=tf_val,
+            is_testnet=(self.account_mode_name == "TESTNET"),
         )
         logger.info(
             "ENTRY çalıştırıldı | %s %s %sx | qty=%s | %s | order=%s",
@@ -663,7 +896,7 @@ class BybitTrader:
             latency_info,
             order.get("id"),
         )
-        send_telegram(msg)
+        send_telegram(msg, reply_markup=buttons)
 
     def _handle_tp(
         self,
@@ -681,12 +914,23 @@ class BybitTrader:
             logger.info("%s için açık pozisyon yok, %s atlandı.", symbol, event.upper())
             return
 
-        trade_state = self._active_trades.get(symbol, {})
+        trade_state = dict(self._active_trades.get(symbol) or {})
         pct = payload.get("close_pct")
         if pct is None:
             pct_list = trade_state.get("close_pct", [25, 25, 25, 25])
             pct = pct_list[tp_index] if tp_index < len(pct_list) else 0
         pct = float(pct)
+
+        tf_val = str(payload.get("tf") or trade_state.get("tf") or Config.TV_INTERVAL)
+        ticker = _symbol_to_ticker(symbol)
+        tf_label = _format_tf_label(tf_val)
+        side_badge = "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
+        mode_tag = self._short_mode_tag()
+        buttons = _build_trade_buttons(
+            symbol,
+            tf=tf_val,
+            is_testnet=(self.account_mode_name == "TESTNET"),
+        )
 
         new_sl = payload.get("sl")
         if pct <= 0 and event != "tp4":
@@ -694,14 +938,15 @@ class BybitTrader:
             if symbol in self._active_trades:
                 self._active_trades[symbol]["sl"] = new_sl
             msg = (
-                f"🎯 <b>PSL AI {event.upper()} (Kâr Stobu Güncellendi)</b>\n"
-                f"• Parite: <code>{symbol}</code> ({side.upper()})\n"
-                f"• Kapatılan: %0 (Kâr Stobu Modu)\n"
-                f"• Yeni SL Seviyesi: <code>{new_sl}</code>\n"
-                f"• Kaynak: {source} | {latency_info}"
+                f"🎯 <b>{event.upper()} HEDEFİ — KÂR STOBU GÜNCELLENDİ</b> · <code>[{mode_tag}]</code>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
+                f"📦 <b>Kapatılan:</b> %0 <i>(İz Süren Stop Modu)</i>\n"
+                f"🛡️ <b>Yeni Stop (SL):</b> <code>{_fmt_price(new_sl)}</code>\n\n"
+                f"🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
             )
-            logger.info("%s %s tetiklendi (%0 kapatma), yeni SL=%s | %s", symbol, event.upper(), new_sl, latency_info)
-            send_telegram(msg)
+            logger.info("%s %s tetiklendi (%%0 kapatma), yeni SL=%s | %s", symbol, event.upper(), new_sl, latency_info)
+            send_telegram(msg, reply_markup=buttons)
             return
 
         if event == "tp4" or pct >= 100:
@@ -729,7 +974,7 @@ class BybitTrader:
             if event == "tp4" or remaining <= 0:
                 self._active_trades.pop(symbol, None)
 
-        sl_note = f"{new_sl}"
+        sl_line = ""
         if event != "tp4" and remaining > 0 and new_sl:
             sl_ok = self._set_exchange_trailing_sl(symbol, side, float(new_sl))
             if not sl_ok:
@@ -743,19 +988,43 @@ class BybitTrader:
                         reduce_only=True,
                     )
                 self._active_trades.pop(symbol, None)
-                sl_note = f"{new_sl} (Fiyat döndüğü için kalan pozisyon kârda kapatıldı)"
+                remaining = 0.0
+                sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(new_sl)}</code> <i>(Fiyat döndü, kalanı kârda kapatıldı)</i>\n"
             else:
-                sl_note = f"{new_sl} (Bybit borsasına SL konuldu)"
+                sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(new_sl)}</code> <i>(Bybit'e İşlendi ✅)</i>\n"
+
+        entry_px = float(trade_state.get("entry_price") or 0.0)
+        exit_px = float(order.get("average") or order.get("price") or payload.get("price") or 0.0)
+        if exit_px <= 0:
+            exit_px = self._get_ref_price(symbol, 0.0)
+        bal = self.refresh_balance()
+
+        header = (
+            f"🏆 <b>TP4 TAMAMLANDI — TÜM HEDEFLER VURULDU!</b> · <code>[{mode_tag}]</code>"
+            if event == "tp4"
+            else f"💰 <b>{event.upper()} KÂR ALINDI</b> · <code>[{mode_tag}]</code>"
+        )
+        rem_str = "Kapanış Tamamlandı" if remaining <= 0 else f"Kalan: <code>{_fmt_qty(remaining)}</code>"
+        metrics_block = _format_close_metrics(
+            entry_px=entry_px,
+            exit_px=exit_px,
+            qty=close_qty,
+            side=side,
+            pnl_label="Tahmini Kâr (Bu Kapanış)",
+            bal=bal,
+        )
 
         msg = (
-            f"💰 <b>PSL AI {event.upper()} KÂR ALINDI</b>\n"
-            f"• Parite: <code>{symbol}</code> ({side.upper()})\n"
-            f"• Kapatılan Miktar: <code>{close_qty}</code> (%{pct:.0f})\n"
-            f"• Güncel SL: <code>{sl_note}</code>\n"
-            f"• Kaynak: {source} | {latency_info} | Order: <code>{order.get('id')}</code>"
+            f"{header}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
+            f"📦 <b>Kapatılan:</b> <code>{_fmt_qty(close_qty)}</code> (%{pct:.0f}) · {rem_str}\n"
+            f"{sl_line}"
+            f"{metrics_block}"
+            f"\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
         )
         logger.info("%s %s kapatıldı | qty=%s | %s", symbol, event.upper(), close_qty, latency_info)
-        send_telegram(msg)
+        send_telegram(msg, reply_markup=buttons)
 
     def _handle_close(
         self,
@@ -767,6 +1036,7 @@ class BybitTrader:
         source: str,
         latency_info: str,
     ) -> None:
+        trade_state = dict(self._active_trades.get(symbol) or {})
         open_qty = self._get_open_position(symbol, side)
         if open_qty <= 0:
             logger.info("%s için açık pozisyon yok, %s atlandı.", symbol, event.upper())
@@ -783,16 +1053,55 @@ class BybitTrader:
         )
         self._active_trades.pop(symbol, None)
 
-        title = "🛑 PSL AI STOP LOSS (Mum Kapanışı)" if event == "stop" else "⚠️ PSL AI LİKİDASYON"
+        tf_val = str(payload.get("tf") or trade_state.get("tf") or Config.TV_INTERVAL)
+        ticker = _symbol_to_ticker(symbol)
+        tf_label = _format_tf_label(tf_val)
+        side_badge = "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
+        mode_tag = self._short_mode_tag()
+        buttons = _build_trade_buttons(
+            symbol,
+            tf=tf_val,
+            is_testnet=(self.account_mode_name == "TESTNET"),
+        )
+
+        entry_px = float(trade_state.get("entry_price") or 0.0)
+        exit_px = float(order.get("average") or order.get("price") or payload.get("price") or 0.0)
+        if exit_px <= 0:
+            exit_px = self._get_ref_price(symbol, 0.0)
+
+        est_pnl = (
+            ((exit_px - entry_px) * open_qty if side == "long" else (entry_px - exit_px) * open_qty)
+            if (entry_px > 0 and exit_px > 0)
+            else None
+        )
+        bal = self.refresh_balance()
+
+        if event == "liquidation":
+            header = f"⚠️ <b>LİKİDASYON — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
+        elif event == "stop" and est_pnl is not None and est_pnl > 0:
+            header = f"🛡️ <b>KÂR STOBU — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
+        else:
+            header = f"🛑 <b>STOP LOSS — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
+
+        metrics_block = _format_close_metrics(
+            entry_px=entry_px,
+            exit_px=exit_px,
+            qty=open_qty,
+            side=side,
+            pnl_label="Tahmini Sonuç (Kalan)",
+            bal=bal,
+        )
+
         msg = (
-            f"{title}\n"
-            f"• Parite: <code>{symbol}</code> ({side.upper()})\n"
-            f"• Kapatılan Tam Pozisyon: <code>{open_qty}</code>\n"
-            f"• Sonuç/PnL (İndikatör): <code>{payload.get('result')}</code> / <code>{payload.get('pnl')}</code>\n"
-            f"• Kaynak: {source} | {latency_info} | Order: <code>{order.get('id')}</code>"
+            f"{header}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
+            f"📦 <b>Kapatılan Miktar:</b> <code>{_fmt_qty(open_qty)}</code>\n"
+            f"{metrics_block}"
+            f"\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
         )
         logger.info("%s %s kapatıldı | qty=%s | %s", symbol, event.upper(), open_qty, latency_info)
-        send_telegram(msg)
+        send_telegram(msg, reply_markup=buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +1206,7 @@ def _process_unseen_emails(client: IMAPClient, startup_cutoff_ts: float) -> None
             process_signal(payload, source="Gmail IMAP IDLE", email_sent_ts=email_ts)
         except Exception as exc:
             logger.exception("E-posta sinyali işlenirken hata oluştu (UID=%s): %s", uid, exc)
-            send_telegram(f"❌ <b>E-posta Sinyali Hatası:</b> <code>{exc}</code>")
+            send_telegram(f"❌ <b>E-posta Sinyali Hatası:</b> <code>{html.escape(str(exc))}</code>")
 
 
 def imap_idle_worker(stop_event: threading.Event) -> None:
@@ -1130,14 +1439,42 @@ async def lifespan(_: FastAPI):
         _imap_thread.start()
 
     mode = _bot_mode_label()
-    bal_str = f"{trader.usdt_balance:.2f} USDT" if trader.usdt_balance is not None else "-"
+    bal_str = f"{trader.usdt_balance:.2f} USDT" if trader.usdt_balance is not None else "—"
+    raw_symbols = [s.strip() for s in Config.TV_SYMBOL.split(",") if s.strip()]
+    clean_bases = [_ticker_base(s) for s in raw_symbols]
+    coins_preview = " · ".join(clean_bases) if clean_bases else "—"
+    tf_label = _format_tf_label(Config.TV_INTERVAL)
+    tv_status_label = "🟢 Canlı WebSocket Aktif" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı"
+
+    startup_rows: list[list[dict[str, str]]] = []
+    if raw_symbols:
+        first_tv_url, first_bybit_url = _build_trade_urls(
+            raw_symbols[0],
+            tf=Config.TV_INTERVAL,
+            is_testnet=(trader.account_mode_name == "TESTNET"),
+        )
+        startup_rows.append(
+            [
+                {"text": f"📈 TradingView ({clean_bases[0]})", "url": first_tv_url},
+                {"text": f"⚡ Bybit ({clean_bases[0]})", "url": first_bybit_url},
+            ]
+        )
+    if Config.PUBLIC_URL:
+        startup_rows.append([{"text": "🖥️ Canlı Bot Paneli", "url": Config.PUBLIC_URL}])
+
     send_telegram(
-        f"✅ <b>PSL AI Bybit Bot Başlatıldı</b>\n"
-        f"• Mod: <b>{mode}</b> (Bakiye: <code>{bal_str}</code>)\n"
-        f"• Parite: <code>{Config.TV_SYMBOL}</code> ({Config.TV_INTERVAL})\n"
-        f"• İşlem Başı Marjin: <code>{Config.MARGIN_USDT} USDT</code> | Maks Kaldıraç: <code>{Config.MAX_LEVERAGE}x</code>\n"
-        f"• Bulut Tarayıcı (Playwright): <b>{'Aktif' if Config.ENABLE_PLAYWRIGHT else 'Kapalı'}</b>\n"
-        f"• E-posta Dinleyici: <b>{'Aktif' if Config.ENABLE_IMAP else 'Kapalı'}</b>"
+        f"✅ <b>PSL AI BYBIT BOT AKTİF</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏦 <b>Hesap Modu:</b> <code>{html.escape(mode)}</code>\n"
+        f"💰 <b>Bakiye:</b> <code>{bal_str}</code>\n"
+        f"⏱️ <b>Zaman Dilimi:</b> <code>{html.escape(tf_label)}</code>\n"
+        f"🪙 <b>İzlenen Coinler ({len(clean_bases)}):</b>\n"
+        f"<code>{html.escape(coins_preview)}</code>\n\n"
+        f"⚙️ <b>İşlem Ayarları</b>\n"
+        f"├ <b>Marjin / İşlem:</b> <code>{Config.MARGIN_USDT:g} USDT</code>\n"
+        f"├ <b>Maks. Kaldıraç:</b> <code>{Config.MAX_LEVERAGE}x</code>\n"
+        f"└ <b>Veri Akışı:</b> {tv_status_label}",
+        reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,
     )
     yield
     _stop_event.set()
