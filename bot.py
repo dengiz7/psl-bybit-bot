@@ -84,9 +84,10 @@ class Config:
 
     # Risk & Pozisyon Ayarları
     DRY_RUN: bool = _env_bool("DRY_RUN", False)
-    MARGIN_USDT: float = _env_float("MARGIN_USDT", 15.0)
-    DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 50)
-    MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 50)
+    MARGIN_USDT: float = _env_float("MARGIN_USDT", 10.0)
+    DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 20)
+    MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 20)
+    MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 3)
     AUTO_TF_LEVERAGE: bool = _env_bool("AUTO_TF_LEVERAGE", True)
     EMERGENCY_HARD_SL_PCT: float = _env_float("EMERGENCY_HARD_SL_PCT", 0.0)
 
@@ -99,11 +100,13 @@ class Config:
     }
     MAX_EMAIL_AGE_SEC: int = _env_int("MAX_EMAIL_AGE_SEC", 180)
 
-    # Bulut Görünmez Tarayıcı (Playwright - Ücretsiz TradingView Çözümü)
+    # Veri Akışı (Bybit Quant Dual-Alpha veya TradingView WebSocket)
+    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
+    QUANT_MODE: str = os.getenv("QUANT_MODE", "DUAL").strip().upper()
     ENABLE_PLAYWRIGHT: bool = _env_bool("ENABLE_PLAYWRIGHT", True)
     TV_CHART_URL: str = os.getenv("TV_CHART_URL", "").strip()
     TV_SYMBOL: str = os.getenv("TV_SYMBOL", "BYBIT:BTCUSDT.P").strip()
-    TV_INTERVAL: str = os.getenv("TV_INTERVAL", "15").strip()
+    TV_INTERVAL: str = os.getenv("TV_INTERVAL", "5").strip()
     TV_SESSIONID: str = os.getenv("TV_SESSIONID", "").strip()
     TV_SESSIONID_SIGN: str = os.getenv("TV_SESSIONID_SIGN", "").strip()
     TV_POLL_SEC: float = _env_float("TV_POLL_SEC", 2.0)
@@ -458,6 +461,7 @@ class SignalDeduplicator:
             str(payload.get("symbol", "")).upper(),
             str(payload.get("trade_id", "")),
             str(payload.get("event", "")).lower(),
+            str(payload.get("close_pct", "")),
             str(payload.get("time", "")),
         ]
         dedup_key = "|".join(key_parts)
@@ -609,6 +613,17 @@ class BybitTrader:
                     return contracts
         return 0.0
 
+    def _count_total_open_positions(self) -> int:
+        """Borsadaki toplam aktif açık pozisyon sayısını döndürür (eşzamanlı risk sınırı için)."""
+        if Config.DRY_RUN or self._exchange is None:
+            return len(self._active_trades)
+        try:
+            positions = self._exchange.fetch_positions()
+            return sum(1 for p in positions if float(p.get("contracts") or 0.0) > 0)
+        except Exception as exc:
+            logger.warning("Açık pozisyon sayısı sorgulanamadı: %s", exc)
+            return len(self._active_trades)
+
     def _get_ref_price(self, symbol: str, fallback_price: float) -> float:
         if Config.DRY_RUN or self._exchange is None:
             return fallback_price
@@ -686,13 +701,15 @@ class BybitTrader:
             return True
         except Exception as exc:
             err_txt = str(exc).lower()
+            if "34040" in err_txt or "not modified" in err_txt:
+                return True
             if any(k in err_txt for k in ("10001", "should be", "greater", "lower", "less", "higher")):
                 logger.warning("%s SL fiyatı (%s) piyasa tarafından zaten geçilmiş: %s", symbol, sl_price, exc)
                 return False
             logger.warning("%s Bybit SL güncelleme uyarısı: %s", symbol, exc)
             return True
 
-    def execute_signal(self, payload: dict[str, Any], source: str, latency_info: str) -> None:
+    def execute_signal(self, payload: dict[str, Any], source: str, latency_info: str) -> str:
         event = str(payload.get("event", "")).lower().strip()
         raw_symbol = str(payload.get("symbol", "")).strip()
         ccxt_symbol = normalize_symbol(raw_symbol)
@@ -701,33 +718,38 @@ class BybitTrader:
 
         if side not in ("long", "short"):
             logger.warning("Geçersiz yön (side=%s), sinyal atlandı: %s", side, payload)
-            return
+            return "ignored"
 
         if Config.ALLOWED_SYMBOLS:
             base_check = raw_symbol.upper().replace(".P", "")
             if raw_symbol.upper() not in Config.ALLOWED_SYMBOLS and base_check not in Config.ALLOWED_SYMBOLS:
                 logger.info("Sembol izin listesinde değil (%s), sinyal atlandı.", raw_symbol)
-                return
+                return "ignored"
 
         with self._lock:
             if event == "entry":
-                self._handle_entry(payload, ccxt_symbol, side, trade_id, source, latency_info)
-            elif event in ("tp1", "tp2", "tp3", "tp4"):
+                return self._handle_entry(payload, ccxt_symbol, side, trade_id, source, latency_info)
+            if event in ("tp1", "tp2", "tp3", "tp4"):
                 self._handle_tp(payload, event, ccxt_symbol, side, trade_id, source, latency_info)
-            elif event in ("stop", "liquidation"):
+                return "ok"
+            if event in ("stop", "liquidation"):
                 self._handle_close(payload, event, ccxt_symbol, side, trade_id, source, latency_info)
-            else:
-                logger.warning("Bilinmeyen PSL AI event türü: %s", event)
+                return "ok"
+            logger.warning("Bilinmeyen sinyal event türü: %s", event)
+            return "ignored"
 
     def _resolve_leverage(self, payload: dict[str, Any], symbol: str) -> int:
         """İşlem kaldıracını belirler ve Bybit market üst sınırına göre kırpar."""
-        if Config.AUTO_TF_LEVERAGE:
+        explicit_lev = payload.get("leverage")
+        if explicit_lev:
+            req_lev = int(explicit_lev)
+        elif Config.AUTO_TF_LEVERAGE:
             tf = str(payload.get("tf") or Config.TV_INTERVAL).strip().lower()
             tf_table = {
-                "1": 50,
-                "1m": 50,
-                "5": 50,
-                "5m": 50,
+                "1": 20,
+                "1m": 20,
+                "5": 20,
+                "5m": 20,
                 "15": 20,
                 "15m": 20,
                 "60": 15,
@@ -737,7 +759,7 @@ class BybitTrader:
             }
             req_lev = tf_table.get(tf, Config.DEFAULT_LEVERAGE)
         else:
-            req_lev = int(payload.get("leverage") or Config.DEFAULT_LEVERAGE)
+            req_lev = Config.DEFAULT_LEVERAGE
 
         lev = max(1, min(req_lev, Config.MAX_LEVERAGE))
         if self._exchange and self._exchange.markets and symbol in self._exchange.markets:
@@ -761,6 +783,15 @@ class BybitTrader:
             return "CANLI"
         return "TESTNET" if Config.BYBIT_TESTNET else "CANLI"
 
+    @staticmethod
+    def _engine_footer(payload: dict[str, Any], trade_state: Optional[dict[str, Any]] = None, source: str = "") -> str:
+        eng = payload.get("engine") or (trade_state or {}).get("engine")
+        if eng:
+            return f"Quant Dual-Alpha ({html.escape(str(eng))})"
+        if "Quant" in source:
+            return "Quant Dual-Alpha"
+        return "PSL AI v2.1"
+
     def _handle_entry(
         self,
         payload: dict[str, Any],
@@ -769,7 +800,7 @@ class BybitTrader:
         trade_id: Any,
         source: str,
         latency_info: str,
-    ) -> None:
+    ) -> str:
         opposite_side = "short" if side == "long" else "long"
         opp_qty = self._get_open_position(symbol, opposite_side)
         if opp_qty > 0:
@@ -791,7 +822,18 @@ class BybitTrader:
                 side,
                 existing_qty,
             )
-            return
+            return "skipped_existing"
+
+        if Config.MAX_OPEN_POSITIONS > 0:
+            open_cnt = self._count_total_open_positions()
+            if open_cnt >= Config.MAX_OPEN_POSITIONS:
+                logger.info(
+                    "%s girişi atlandı: eşzamanlı açık pozisyon sınırına ulaşıldı (%s/%s).",
+                    symbol,
+                    open_cnt,
+                    Config.MAX_OPEN_POSITIONS,
+                )
+                return "skipped_max_open"
 
         leverage = self._resolve_leverage(payload, symbol)
         self._set_leverage(symbol, leverage)
@@ -800,20 +842,27 @@ class BybitTrader:
         ref_price = self._get_ref_price(symbol, signal_price)
         if ref_price <= 0:
             logger.error("Geçerli fiyat bulunamadı (%s), giriş iptal.", symbol)
-            return
+            return "skipped_price"
 
         notional = Config.MARGIN_USDT * leverage
         raw_qty = notional / ref_price
         qty = self._format_amount(symbol, raw_qty)
         if qty <= 0:
             logger.error("Hesaplanan miktar 0 veya minimumun altında (%s, raw=%s).", symbol, raw_qty)
-            return
+            return "skipped_qty"
 
-        # İsteğe bağlı acil durum koruma stobu (varsayılan 0 = kapalı; mum kapanışı stop kuralı için)
-        emergency_sl: Optional[float] = None
-        if Config.EMERGENCY_HARD_SL_PCT > 0:
+        # Quant sinyallerinde (veya acil stop ayarlıysa) giriş anında borsaya gerçek Sert Stop Loss (Hard SL) koy
+        hard_sl_val: Optional[float] = None
+        if payload.get("hard_sl") and payload.get("sl"):
+            try:
+                sl_cand = float(payload["sl"])
+                if sl_cand > 0:
+                    hard_sl_val = sl_cand
+            except (TypeError, ValueError):
+                hard_sl_val = None
+        elif Config.EMERGENCY_HARD_SL_PCT > 0:
             pct = Config.EMERGENCY_HARD_SL_PCT / 100.0
-            emergency_sl = ref_price * (1.0 - pct) if side == "long" else ref_price * (1.0 + pct)
+            hard_sl_val = ref_price * (1.0 - pct) if side == "long" else ref_price * (1.0 + pct)
 
         order_side = "buy" if side == "long" else "sell"
         order = self._place_market_order(
@@ -822,8 +871,10 @@ class BybitTrader:
             amount=qty,
             position_side=side,
             reduce_only=False,
-            stop_loss=emergency_sl,
+            stop_loss=hard_sl_val,
         )
+        if hard_sl_val and not Config.DRY_RUN:
+            self._set_exchange_trailing_sl(symbol, side, hard_sl_val)
 
         close_pct = payload.get("close_pct")
         if not isinstance(close_pct, list) or len(close_pct) < 4:
@@ -836,6 +887,9 @@ class BybitTrader:
             "trade_id": trade_id,
             "side": side,
             "tf": tf_val,
+            "engine": payload.get("engine"),
+            "hard_sl": bool(payload.get("hard_sl")),
+            "be_locked": False,
             "leverage": leverage,
             "margin_usdt": Config.MARGIN_USDT,
             "initial_qty": qty,
@@ -859,17 +913,23 @@ class BybitTrader:
         )
         sl_val = payload.get("sl")
         sl_pct = _pct_diff_str(entry_px, sl_val, side)
+        sl_badge = " <i>(Borsada Aktif ✅)</i>" if hard_sl_val else ""
+
+        active_tps: list[tuple[int, Any, int]] = []
+        for i in range(1, 5):
+            tp_pct_share = int(float(close_pct[i - 1])) if i - 1 < len(close_pct) else 25
+            if tp_pct_share > 0 or i <= 2:
+                active_tps.append((i, payload.get(f"tp{i}"), tp_pct_share))
 
         tp_lines: list[str] = []
-        for i in range(1, 5):
-            tp_val = payload.get(f"tp{i}")
-            tp_pct_share = int(float(close_pct[i - 1])) if i - 1 < len(close_pct) else 25
-            prefix = "└" if i == 4 else "├"
+        for idx, (tp_num, tp_val, tp_pct_share) in enumerate(active_tps):
+            prefix = "└" if idx == len(active_tps) - 1 else "├"
             tp_diff = _pct_diff_str(entry_px, tp_val, side)
             tp_lines.append(
-                f"{prefix} <b>TP{i} (%{tp_pct_share}):</b> <code>{_fmt_price(tp_val)}</code>{tp_diff}"
+                f"{prefix} <b>TP{tp_num} (%{tp_pct_share}):</b> <code>{_fmt_price(tp_val)}</code>{tp_diff}"
             )
 
+        footer = self._engine_footer(payload, source=source)
         msg = (
             f"{side_header}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -877,10 +937,10 @@ class BybitTrader:
             f"⚡ <b>Kaldıraç:</b> <code>{leverage}x</code> · <b>Marjin:</b> <code>{Config.MARGIN_USDT:g} USDT</code> (~{notional:.0f} USDT)\n"
             f"📦 <b>Miktar:</b> <code>{_fmt_qty(qty)}</code>\n\n"
             f"📍 <b>Giriş Fiyatı:</b> <code>{_fmt_price(entry_px)}</code>\n"
-            f"🛑 <b>Stop Loss (SL):</b> <code>{_fmt_price(sl_val)}</code>{sl_pct}\n\n"
+            f"🛑 <b>Stop Loss (SL):</b> <code>{_fmt_price(sl_val)}</code>{sl_pct}{sl_badge}\n\n"
             f"🎯 <b>Kâr Hedefleri</b>\n"
             + "\n".join(tp_lines)
-            + f"\n\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
+            + f"\n\n🤖 <i>{footer} · {html.escape(latency_info)}</i>"
         )
         buttons = _build_trade_buttons(
             symbol,
@@ -897,6 +957,7 @@ class BybitTrader:
             order.get("id"),
         )
         send_telegram(msg, reply_markup=buttons)
+        return "ok"
 
     def _handle_tp(
         self,
@@ -926,6 +987,7 @@ class BybitTrader:
         tf_label = _format_tf_label(tf_val)
         side_badge = "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
         mode_tag = self._short_mode_tag()
+        footer = self._engine_footer(payload, trade_state, source)
         buttons = _build_trade_buttons(
             symbol,
             tf=tf_val,
@@ -934,18 +996,23 @@ class BybitTrader:
 
         new_sl = payload.get("sl")
         if pct <= 0 and event != "tp4":
-            # Kâr stopu (trailing SL) modu: pozisyon kapatılmaz, sadece yeni stop seviyesi kaydedilir
+            # Breakeven / Kâr stobu güncelleme modu: pozisyon kapatılmaz, Bybit borsadaki SL yukarı/aşağı çekilir
+            sl_ok = True
+            if new_sl:
+                sl_ok = self._set_exchange_trailing_sl(symbol, side, float(new_sl))
             if symbol in self._active_trades:
                 self._active_trades[symbol]["sl"] = new_sl
+                self._active_trades[symbol]["be_locked"] = True
+            sl_tag = "Bybit'e İşlendi ✅" if sl_ok else "Bot İzlemesinde"
             msg = (
-                f"🎯 <b>{event.upper()} HEDEFİ — KÂR STOBU GÜNCELLENDİ</b> · <code>[{mode_tag}]</code>\n"
+                f"🎯 <b>BREAKEVEN KİLİDİ AKTİF (SL GİRİŞE ÇEKİLDİ)</b> · <code>[{mode_tag}]</code>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
-                f"📦 <b>Kapatılan:</b> %0 <i>(İz Süren Stop Modu)</i>\n"
-                f"🛡️ <b>Yeni Stop (SL):</b> <code>{_fmt_price(new_sl)}</code>\n\n"
-                f"🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
+                f"📦 <b>Pozisyon:</b> Tamamı Açık <i>(1.2R Kâr Koruması)</i>\n"
+                f"🛡️ <b>Yeni Stop (SL):</b> <code>{_fmt_price(new_sl)}</code> <i>({sl_tag})</i>\n\n"
+                f"🤖 <i>{footer} · {html.escape(latency_info)}</i>"
             )
-            logger.info("%s %s tetiklendi (%%0 kapatma), yeni SL=%s | %s", symbol, event.upper(), new_sl, latency_info)
+            logger.info("%s %s tetiklendi (%%0 kapatma / BE), yeni SL=%s | %s", symbol, event.upper(), new_sl, latency_info)
             send_telegram(msg, reply_markup=buttons)
             return
 
@@ -971,27 +1038,42 @@ class BybitTrader:
         if symbol in self._active_trades:
             self._active_trades[symbol]["remaining_qty"] = remaining
             self._active_trades[symbol]["sl"] = new_sl
+            self._active_trades[symbol]["be_locked"] = True
             if event == "tp4" or remaining <= 0:
                 self._active_trades.pop(symbol, None)
 
         sl_line = ""
         if event != "tp4" and remaining > 0 and new_sl:
-            sl_ok = self._set_exchange_trailing_sl(symbol, side, float(new_sl))
+            sl_val = float(new_sl)
+            sl_ok = self._set_exchange_trailing_sl(symbol, side, sl_val)
             if not sl_ok:
-                rem_live = self._get_open_position(symbol, side)
-                if rem_live > 0:
-                    self._place_market_order(
-                        symbol=symbol,
-                        order_side=close_order_side,
-                        amount=rem_live,
-                        position_side=side,
-                        reduce_only=True,
+                cur_px = self._get_ref_price(symbol, 0.0)
+                crossed_sl = cur_px > 0 and (
+                    (side == "long" and cur_px <= sl_val) or (side == "short" and cur_px >= sl_val)
+                )
+                if crossed_sl:
+                    rem_live = self._get_open_position(symbol, side)
+                    if rem_live > 0:
+                        self._place_market_order(
+                            symbol=symbol,
+                            order_side=close_order_side,
+                            amount=rem_live,
+                            position_side=side,
+                            reduce_only=True,
+                        )
+                    self._active_trades.pop(symbol, None)
+                    remaining = 0.0
+                    sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(sl_val)}</code> <i>(Fiyat döndü, kalanı kârda kapatıldı)</i>\n"
+                else:
+                    logger.warning(
+                        "%s borsaya SL yerleştirilemedi (%s), ancak anlık fiyat (%s) SL'yi geçmediği için kalan açık tutuldu.",
+                        symbol,
+                        sl_val,
+                        cur_px,
                     )
-                self._active_trades.pop(symbol, None)
-                remaining = 0.0
-                sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(new_sl)}</code> <i>(Fiyat döndü, kalanı kârda kapatıldı)</i>\n"
+                    sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(sl_val)}</code> <i>(Bot İzlemesinde)</i>\n"
             else:
-                sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(new_sl)}</code> <i>(Bybit'e İşlendi ✅)</i>\n"
+                sl_line = f"🛡️ <b>Yeni SL:</b> <code>{_fmt_price(sl_val)}</code> <i>(Bybit'e İşlendi ✅)</i>\n"
 
         entry_px = float(trade_state.get("entry_price") or 0.0)
         exit_px = float(order.get("average") or order.get("price") or payload.get("price") or 0.0)
@@ -1000,7 +1082,7 @@ class BybitTrader:
         bal = self.refresh_balance()
 
         header = (
-            f"🏆 <b>TP4 TAMAMLANDI — TÜM HEDEFLER VURULDU!</b> · <code>[{mode_tag}]</code>"
+            f"🏆 <b>TÜM HEDEFLER VURULDU — POZİSYON KAPANDI!</b> · <code>[{mode_tag}]</code>"
             if event == "tp4"
             else f"💰 <b>{event.upper()} KÂR ALINDI</b> · <code>[{mode_tag}]</code>"
         )
@@ -1021,7 +1103,7 @@ class BybitTrader:
             f"📦 <b>Kapatılan:</b> <code>{_fmt_qty(close_qty)}</code> (%{pct:.0f}) · {rem_str}\n"
             f"{sl_line}"
             f"{metrics_block}"
-            f"\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
+            f"\n🤖 <i>{footer} · {html.escape(latency_info)}</i>"
         )
         logger.info("%s %s kapatıldı | qty=%s | %s", symbol, event.upper(), close_qty, latency_info)
         send_telegram(msg, reply_markup=buttons)
@@ -1038,9 +1120,49 @@ class BybitTrader:
     ) -> None:
         trade_state = dict(self._active_trades.get(symbol) or {})
         open_qty = self._get_open_position(symbol, side)
+        self._active_trades.pop(symbol, None)
+
+        tf_val = str(payload.get("tf") or trade_state.get("tf") or Config.TV_INTERVAL)
+        ticker = _symbol_to_ticker(symbol)
+        tf_label = _format_tf_label(tf_val)
+        side_badge = "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
+        mode_tag = self._short_mode_tag()
+        footer = self._engine_footer(payload, trade_state, source)
+        buttons = _build_trade_buttons(
+            symbol,
+            tf=tf_val,
+            is_testnet=(self.account_mode_name == "TESTNET"),
+        )
+
         if open_qty <= 0:
-            logger.info("%s için açık pozisyon yok, %s atlandı.", symbol, event.upper())
-            self._active_trades.pop(symbol, None)
+            logger.info("%s için açık pozisyon kalmamış, %s senkronize edildi.", symbol, event.upper())
+            if trade_state:
+                bal = self.refresh_balance()
+                entry_px = float(trade_state.get("entry_price") or 0.0)
+                est_exit = float(trade_state.get("sl") or payload.get("price") or 0.0)
+                rem_qty = float(trade_state.get("remaining_qty") or trade_state.get("initial_qty") or 0.0)
+                hdr = (
+                    f"🛡️ <b>BREAKEVEN STOP — BORSA KAPATTI</b> · <code>[{mode_tag}]</code>"
+                    if trade_state.get("be_locked")
+                    else f"🛑 <b>BORSA STOP LOSS — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
+                )
+                metrics_block = _format_close_metrics(
+                    entry_px=entry_px,
+                    exit_px=est_exit,
+                    qty=rem_qty,
+                    side=side,
+                    pnl_label="Tahmini Sonuç",
+                    bal=bal,
+                )
+                msg = (
+                    f"{hdr}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
+                    f"📦 <b>Durum:</b> Bybit sunucu tarafı SL emri tetiklendi\n"
+                    f"{metrics_block}"
+                    f"\n🤖 <i>{footer} · {html.escape(latency_info)}</i>"
+                )
+                send_telegram(msg, reply_markup=buttons)
             return
 
         close_order_side = "sell" if side == "long" else "buy"
@@ -1050,18 +1172,6 @@ class BybitTrader:
             amount=open_qty,
             position_side=side,
             reduce_only=True,
-        )
-        self._active_trades.pop(symbol, None)
-
-        tf_val = str(payload.get("tf") or trade_state.get("tf") or Config.TV_INTERVAL)
-        ticker = _symbol_to_ticker(symbol)
-        tf_label = _format_tf_label(tf_val)
-        side_badge = "🟢 <b>LONG</b>" if side == "long" else "🔴 <b>SHORT</b>"
-        mode_tag = self._short_mode_tag()
-        buttons = _build_trade_buttons(
-            symbol,
-            tf=tf_val,
-            is_testnet=(self.account_mode_name == "TESTNET"),
         )
 
         entry_px = float(trade_state.get("entry_price") or 0.0)
@@ -1078,8 +1188,8 @@ class BybitTrader:
 
         if event == "liquidation":
             header = f"⚠️ <b>LİKİDASYON — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
-        elif event == "stop" and est_pnl is not None and est_pnl > 0:
-            header = f"🛡️ <b>KÂR STOBU — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
+        elif event == "stop" and (trade_state.get("be_locked") or (est_pnl is not None and est_pnl >= 0)):
+            header = f"🛡️ <b>BREAKEVEN / KÂR STOBU — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
         else:
             header = f"🛑 <b>STOP LOSS — POZİSYON KAPANDI</b> · <code>[{mode_tag}]</code>"
 
@@ -1098,7 +1208,7 @@ class BybitTrader:
             f"🪙 <b>Parite:</b> <code>#{ticker}</code> · {side_badge} · <b>{html.escape(tf_label)}</b>\n"
             f"📦 <b>Kapatılan Miktar:</b> <code>{_fmt_qty(open_qty)}</code>\n"
             f"{metrics_block}"
-            f"\n🤖 <i>PSL AI v2.1 · {html.escape(latency_info)}</i>"
+            f"\n🤖 <i>{footer} · {html.escape(latency_info)}</i>"
         )
         logger.info("%s %s kapatıldı | qty=%s | %s", symbol, event.upper(), open_qty, latency_info)
         send_telegram(msg, reply_markup=buttons)
@@ -1144,7 +1254,9 @@ def process_signal(
     if trader is None:
         raise RuntimeError("BybitTrader henüz başlatılmadı.")
 
-    trader.execute_signal(payload, source=source, latency_info=latency_info)
+    exec_res = trader.execute_signal(payload, source=source, latency_info=latency_info)
+    if exec_res.startswith("skipped"):
+        return {"status": "skipped", "reason": exec_res}
     return {"status": "ok"}
 
 
@@ -1318,9 +1430,14 @@ def _render_dashboard_html() -> str:
         )
 
     tf_lev_text = (
-        "Aktif (5dk:50x, 15dk:20x, 1s:15x, 4s:8x)"
+        "Aktif (5dk:20x, 15dk:20x, 1s:15x, 4s:8x)"
         if Config.AUTO_TF_LEVERAGE
         else f"Kapalı (Sabit {Config.DEFAULT_LEVERAGE}x)"
+    )
+    engine_title = (
+        f"Quant 5dk Dual-Alpha ({Config.QUANT_MODE})"
+        if Config.ENGINE_MODE != "PSL_TV"
+        else "PSL AI v2.1 (TradingView WebSocket)"
     )
 
     coins_dict = status.get("coins") or {}
@@ -1386,16 +1503,16 @@ def _render_dashboard_html() -> str:
         <div class="row"><span class="lbl">Cüzdan Bakiyesi</span><span class="val">{esc(balance_text)}</span></div>
         <div class="row"><span class="lbl">Çalışma Modu</span><span class="val">{esc(mode_label)}</span></div>
         <div class="row"><span class="lbl">İşlem Başı Marjin</span><span class="val">{Config.MARGIN_USDT} USDT</span></div>
-        <div class="row"><span class="lbl">Maks. Kaldıraç</span><span class="val">{Config.MAX_LEVERAGE}x</span></div>
+        <div class="row"><span class="lbl">Maks. Kaldıraç / Eşzamanlı İşlem</span><span class="val">{Config.MAX_LEVERAGE}x · Maks {Config.MAX_OPEN_POSITIONS}</span></div>
         <div class="row"><span class="lbl">Otomatik Zaman Dilimi Kaldıracı</span><span class="val">{esc(tf_lev_text)}</span></div>
-        <div class="row"><span class="lbl">TradingView Akışı</span><span class="val">{'Aktif' if Config.ENABLE_PLAYWRIGHT else 'Kapalı'} ({esc(status.get('state'))})</span></div>
+        <div class="row"><span class="lbl">Strateji Motoru</span><span class="val">{esc(engine_title)} ({esc(status.get('state'))})</span></div>
         <div class="row"><span class="lbl">Mail (IMAP)</span><span class="val">{'Aktif' if Config.ENABLE_IMAP else 'Kapalı'}</span></div>
       </div>
       {coin_cards_html}
     </div>
 
     <div class="shot-box">
-      <h2>📋 Canlı PSL AI Paneli & Piyasa Yorumu (TradingView WebSocket)</h2>
+      <h2>📋 Canlı Motor & İndikatör Durumu ({esc(engine_title)})</h2>
       {live_panels_html}
     </div>
   </div>
@@ -1444,7 +1561,16 @@ async def lifespan(_: FastAPI):
     clean_bases = [_ticker_base(s) for s in raw_symbols]
     coins_preview = " · ".join(clean_bases) if clean_bases else "—"
     tf_label = _format_tf_label(Config.TV_INTERVAL)
-    tv_status_label = "🟢 Canlı WebSocket Aktif" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı"
+    tv_status_label = (
+        f"🟢 Bybit Quant ({Config.QUANT_MODE})"
+        if Config.ENGINE_MODE != "PSL_TV"
+        else ("🟢 TradingView WebSocket" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı")
+    )
+    bot_title = (
+        "BYBIT QUANT 5DK DUAL-ALPHA BOT AKTİF"
+        if Config.ENGINE_MODE != "PSL_TV"
+        else "PSL AI BYBIT BOT AKTİF"
+    )
 
     startup_rows: list[list[dict[str, str]]] = []
     if raw_symbols:
@@ -1463,17 +1589,17 @@ async def lifespan(_: FastAPI):
         startup_rows.append([{"text": "🖥️ Canlı Bot Paneli", "url": Config.PUBLIC_URL}])
 
     send_telegram(
-        f"✅ <b>PSL AI BYBIT BOT AKTİF</b>\n"
+        f"✅ <b>{bot_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🏦 <b>Hesap Modu:</b> <code>{html.escape(mode)}</code>\n"
         f"💰 <b>Bakiye:</b> <code>{bal_str}</code>\n"
         f"⏱️ <b>Zaman Dilimi:</b> <code>{html.escape(tf_label)}</code>\n"
         f"🪙 <b>İzlenen Coinler ({len(clean_bases)}):</b>\n"
         f"<code>{html.escape(coins_preview)}</code>\n\n"
-        f"⚙️ <b>İşlem Ayarları</b>\n"
+        f"⚙️ <b>Risk & Motor Ayarları</b>\n"
         f"├ <b>Marjin / İşlem:</b> <code>{Config.MARGIN_USDT:g} USDT</code>\n"
-        f"├ <b>Maks. Kaldıraç:</b> <code>{Config.MAX_LEVERAGE}x</code>\n"
-        f"└ <b>Veri Akışı:</b> {tv_status_label}",
+        f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{Config.MAX_LEVERAGE}x</code> · <code>{Config.MAX_OPEN_POSITIONS} işlem</code>\n"
+        f"└ <b>Motor:</b> {tv_status_label}",
         reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,
     )
     yield

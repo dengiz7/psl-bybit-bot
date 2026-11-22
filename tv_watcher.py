@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import random
 import re
 import string
@@ -22,6 +23,9 @@ import aiohttp
 import requests
 
 logger = logging.getLogger("psl-tv-watcher")
+
+ENGINE_MODE = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
+QUANT_MODE = os.getenv("QUANT_MODE", "DUAL").strip().upper()
 
 PSL_SCRIPT_ID = "PUB;dc403b2eacfd4347a5e1b6244f203220"
 PSL_TRANSLATE_URL = f"https://pine-facade.tradingview.com/pine-facade/translate/{PSL_SCRIPT_ID}/last"
@@ -146,8 +150,169 @@ def _extract_first_price(line: str, label_pattern: str) -> Optional[float]:
 
 
 def _tf_close_pct_list(interval: str) -> list[int]:
-    """TP1'de %55 kâr alıp TP2/TP3/TP4'te %15'er kapatarak kârı borsada garantiye alır."""
+    """
+    Zaman dilimine göre optimize edilmiş kısmi kâr alma oranlarını döndürür:
+    - 1 saat (60m) ve üzeri: [40, 30, 20, 10] (büyük trendleri taşıyıp kârı maksimize eder)
+    - 30 dk ve altı: [55, 15, 15, 15] (TP1'de hızlı ağırlık alıp geri dönüş riskini azaltır)
+    """
+    norm = _normalize_interval(interval or "60").upper()
+    if norm in ("60", "120", "240", "D"):
+        return [40, 30, 20, 10]
     return [55, 15, 15, 15]
+
+
+def _tf_sim_leverage(interval: str, fallback: int = 20) -> int:
+    """TradingView iç simülasyon tablosunun (in_29) ve Quant motorunun kaldıracını belirler."""
+    norm = _normalize_interval(interval or "5").upper()
+    mapping = {
+        "1": 20,
+        "3": 20,
+        "5": 20,
+        "15": 20,
+        "30": 20,
+        "60": 15,
+        "120": 15,
+        "240": 8,
+        "D": 8,
+    }
+    return mapping.get(norm, fallback)
+
+
+def _interval_to_bybit(interval: str) -> str:
+    norm = _normalize_interval(interval or "5").upper()
+    return norm if norm in ("1", "3", "5", "15", "30", "60", "120", "240", "D") else "5"
+
+
+def _interval_ms(interval: str) -> int:
+    byb = _interval_to_bybit(interval)
+    if byb == "D":
+        return 86_400_000
+    return int(byb) * 60_000
+
+
+def _calc_ema(vals: list[float], period: int) -> list[float]:
+    n = len(vals)
+    out = [0.0] * n
+    if n == 0:
+        return out
+    k = 2.0 / (period + 1.0)
+    out[0] = vals[0]
+    for i in range(1, n):
+        out[i] = vals[i] * k + out[i - 1] * (1.0 - k)
+    return out
+
+
+def _calc_sma(vals: list[float], period: int) -> list[float]:
+    n = len(vals)
+    out = [0.0] * n
+    run = 0.0
+    for i in range(n):
+        run += vals[i]
+        if i >= period:
+            run -= vals[i - period]
+        out[i] = run / min(i + 1, period)
+    return out
+
+
+def _calc_stdev(vals: list[float], sma_vals: list[float], period: int) -> list[float]:
+    n = len(vals)
+    out = [0.0] * n
+    for i in range(period - 1, n):
+        m = sma_vals[i]
+        s = 0.0
+        for j in range(i - period + 1, i + 1):
+            d = vals[j] - m
+            s += d * d
+        out[i] = math.sqrt(s / period)
+    return out
+
+
+def _calc_atr(bars: list[dict[str, float]], period: int = 14) -> list[float]:
+    n = len(bars)
+    out = [0.0] * n
+    if n == 0:
+        return out
+    trs = [0.0] * n
+    trs[0] = bars[0]["h"] - bars[0]["l"]
+    for i in range(1, n):
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+        trs[i] = max(h - l, abs(h - pc), abs(l - pc))
+    run = sum(trs[:period])
+    for i in range(n):
+        if i < period:
+            out[i] = sum(trs[: i + 1]) / (i + 1)
+        elif i == period:
+            out[i] = (run - trs[0] + trs[i]) / period
+        else:
+            out[i] = (out[i - 1] * (period - 1) + trs[i]) / period
+    return out
+
+
+def _calc_adx(bars: list[dict[str, float]], period: int = 14) -> list[float]:
+    n = len(bars)
+    adx = [0.0] * n
+    if n <= period * 2:
+        return adx
+    sm_tr = sm_pdm = sm_mdm = 0.0
+    dx_list = [0.0] * n
+    for i in range(1, n):
+        h, l, ph, pl, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["h"], bars[i - 1]["l"], bars[i - 1]["c"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        up = h - ph
+        dn = pl - l
+        pdm = up if (up > dn and up > 0) else 0.0
+        mdm = dn if (dn > up and dn > 0) else 0.0
+        if i <= period:
+            sm_tr += tr
+            sm_pdm += pdm
+            sm_mdm += mdm
+        else:
+            sm_tr = sm_tr - (sm_tr / period) + tr
+            sm_pdm = sm_pdm - (sm_pdm / period) + pdm
+            sm_mdm = sm_mdm - (sm_mdm / period) + mdm
+        if i >= period and sm_tr > 0:
+            pdi = 100.0 * sm_pdm / sm_tr
+            mdi = 100.0 * sm_mdm / sm_tr
+            s = pdi + mdi
+            dx_list[i] = 100.0 * abs(pdi - mdi) / s if s > 0 else 0.0
+    start_adx = period * 2
+    if start_adx < n:
+        adx[start_adx] = sum(dx_list[period + 1 : start_adx + 1]) / period
+        for i in range(start_adx + 1, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx_list[i]) / period
+    return adx
+
+
+def _calc_supertrend(
+    bars: list[dict[str, float]], atr_vals: list[float], mult: float = 6.0
+) -> tuple[list[int], list[float]]:
+    n = len(bars)
+    dirs = [1] * n
+    line = [0.0] * n
+    f_ub = [0.0] * n
+    f_lb = [0.0] * n
+    for i in range(n):
+        hl2 = (bars[i]["h"] + bars[i]["l"]) * 0.5
+        ub = hl2 + mult * atr_vals[i]
+        lb = hl2 - mult * atr_vals[i]
+        if i == 0:
+            f_ub[0], f_lb[0], dirs[0], line[0] = ub, lb, 1, lb
+            continue
+        pc = bars[i - 1]["c"]
+        f_ub[i] = ub if (ub < f_ub[i - 1] or pc > f_ub[i - 1]) else f_ub[i - 1]
+        f_lb[i] = lb if (lb > f_lb[i - 1] or pc < f_lb[i - 1]) else f_lb[i - 1]
+        c = bars[i]["c"]
+        if dirs[i - 1] == 1:
+            if c < f_lb[i]:
+                dirs[i], line[i] = -1, f_ub[i]
+            else:
+                dirs[i], line[i] = 1, f_lb[i]
+        else:
+            if c > f_ub[i]:
+                dirs[i], line[i] = 1, f_lb[i]
+            else:
+                dirs[i], line[i] = -1, f_ub[i]
+    return dirs, line
 
 
 def parse_psl_table(lines: list[str]) -> dict[str, Any]:
@@ -385,7 +550,9 @@ class TradingViewPlaywrightWatcher:
                 seen_syms.append(norm)
         self.tv_symbols: list[str] = seen_syms[:15] or ["BYBIT:BTCUSDT.P"]
         self.tv_symbol = self.tv_symbols[0]
-        self.tv_interval = _normalize_interval(tv_interval or "15")
+        self.tv_interval = _normalize_interval(tv_interval or "5")
+        self.engine_mode = os.getenv("ENGINE_MODE", ENGINE_MODE).strip().upper()
+        self.quant_mode = os.getenv("QUANT_MODE", QUANT_MODE).strip().upper()
         self.chart_url = chart_url.strip()
         self.sessionid = sessionid.strip()
         self.sessionid_sign = sessionid_sign.strip()
@@ -399,6 +566,7 @@ class TradingViewPlaywrightWatcher:
         self._thread: Optional[threading.Thread] = None
         self._state_lock = threading.Lock()
         self._trade_seq = int(time.time()) % 100000
+        self._http = requests.Session()
 
         self._coin_states: dict[str, dict[str, Any]] = {}
         for sym in self.tv_symbols:
@@ -411,6 +579,7 @@ class TradingViewPlaywrightWatcher:
                 "parsed_table": {},
                 "active_trade": None,
                 "last_entered_sig": None,
+                "last_closed_ts": None,
                 "non_active_streak": 0,
                 "last_update": None,
                 "needs_login_hint": False,
@@ -531,17 +700,22 @@ class TradingViewPlaywrightWatcher:
 
         meta = (data.get("result") or {}).get("metaInfo") or {}
         inputs = (meta.get("defaults") or {}).get("inputs") or {}
+        sim_lev = _tf_sim_leverage(self.tv_interval, self.default_leverage)
         return {
             "text": inputs["text"],
             "pineId": meta["scriptIdPart"],
             "pineVersion": (meta.get("pine") or {}).get("version", "3.0"),
             "in_27": {"v": 100, "f": True, "t": "integer"},
             "in_28": {"v": 15, "f": True, "t": "integer"},
-            "in_29": {"v": 50, "f": True, "t": "integer"},
+            "in_29": {"v": sim_lev, "f": True, "t": "integer"},
             "in_39": {"v": True, "f": True, "t": "bool"},
         }
 
     def _run_loop(self) -> None:
+        if self.engine_mode != "PSL_TV":
+            self._run_quant_loop()
+            return
+
         logger.info("TradingView WebSocket izleyicisi başlatılıyor: %s", ", ".join(self.tv_symbols))
         self._update_status(running=True, state="TradingView bağlantısı hazırlanıyor...")
 
@@ -856,23 +1030,19 @@ class TradingViewPlaywrightWatcher:
         active = state.get("active_trade")
         if active is not None:
             a_side = active["side"]
-            tf_closes = _tf_close_pct_list(self.tv_interval)
-
-            # Tablo aktiften çıktıysa veya ters yöne aktif plan açtıysa kapat
-            if plan_status == "active" and plan_side in ("long", "short") and plan_side != a_side and has_levels:
-                self._emit_event(sym, "stop", a_side, live_price or active["sl"], active, bar_t, plots)
+            # Orta mumda ÜST TF UYUMSUZ / stopped yanıp sönmelerinde erken stop yapma;
+            # yalnızca mum kapanışında ters yöne aktif plan kesinleşirse eski pozisyonu kapat.
+            if (
+                sds_closed_bar is not None
+                and plan_status == "active"
+                and plan_side in ("long", "short")
+                and plan_side != a_side
+                and has_levels
+            ):
+                self._emit_event(sym, "stop", a_side, sds_closed_bar[1] or live_price or active["sl"], active, sds_closed_bar[0], plots)
                 state["active_trade"] = None
                 state["non_active_streak"] = 0
                 active = None
-            elif table_updated and plan_status in ("waiting", "mismatch", "none", "stopped", "completed"):
-                state["non_active_streak"] = int(state.get("non_active_streak") or 0) + 1
-                if state["non_active_streak"] >= 2:
-                    self._emit_event(sym, "stop", a_side, live_price or active["sl"], active, bar_t, plots)
-                    state["active_trade"] = None
-                    state["non_active_streak"] = 0
-                    return
-            else:
-                state["non_active_streak"] = 0
 
         active = state.get("active_trade")
         if active is not None:
@@ -883,6 +1053,7 @@ class TradingViewPlaywrightWatcher:
                 active["sl"] = sl
 
             # TP1 - TP4 anlık kontrol (✓ işareti veya fiyat teması)
+            tp_just_hit = False
             for idx in range(1, 5):
                 tp_key = f"tp{idx}"
                 if tp_key in active["hit_tps"]:
@@ -896,6 +1067,7 @@ class TradingViewPlaywrightWatcher:
                     )
                 if touched:
                     active["hit_tps"].append(tp_key)
+                    tp_just_hit = True
                     if idx == 1:
                         active["sl"] = active["entry"]
                     elif idx == 2:
@@ -919,8 +1091,8 @@ class TradingViewPlaywrightWatcher:
                         state["active_trade"] = None
                         return
 
-            # TP1+ alındıktan sonra iz süren stopu canlı fiyatta anlık koru
-            if active["hit_tps"] and live_price is not None and active.get("sl"):
+            # TP1+ alındıktan sonra iz süren stopu canlı fiyatta anlık koru (TP vurulduğu aynı tick hariç)
+            if not tp_just_hit and active["hit_tps"] and live_price is not None and active.get("sl"):
                 trail_sl = active["sl"]
                 trail_hit = (
                     (a_side == "long" and live_price <= trail_sl)
@@ -1086,7 +1258,9 @@ class TradingViewPlaywrightWatcher:
         v: list[Any],
         close_pct: Optional[int] = None,
         new_sl: Optional[float] = None,
-    ) -> None:
+        extra_payload: Optional[dict[str, Any]] = None,
+        source_label: str = "TradingView WebSocket (PSL AI)",
+    ) -> Any:
         payload: dict[str, Any] = {
             "key": self.secret_key,
             "event": event,
@@ -1125,8 +1299,402 @@ class TradingViewPlaywrightWatcher:
             pnl_val = _clean_num(self._plot(v, 8)) or 0.0
             payload.update({"result": event, "pnl": pnl_val})
 
-        logger.info("TradingView WebSocket sinyali yakalandı: %s %s (%s)", event.upper(), sym, side)
+        if extra_payload:
+            payload.update(extra_payload)
+
+        logger.info("Sinyal tetiklendi (%s): %s %s (%s)", source_label, event.upper(), sym, side)
         try:
-            self._signal_callback(payload, "TradingView WebSocket (PSL AI)")
+            return self._signal_callback(payload, source_label)
         except Exception as exc:
-            logger.exception("WebSocket sinyali işlenirken hata: %s", exc)
+            logger.exception("Sinyal işlenirken hata: %s", exc)
+            return None
+
+    # -----------------------------------------------------------------------
+    # Doğrudan Bybit 5m Quant Dual-Alpha Motoru (ST20_M6 + SQZ36_ADX22 + BTC)
+    # -----------------------------------------------------------------------
+    def _fetch_bybit_klines_sync(
+        self, rest_symbol: str, interval: str, limit: int = 650
+    ) -> tuple[list[dict[str, float]], Optional[dict[str, float]]]:
+        """Bybit V5 public kline verisini çeker ve kapalı mumlar + açık mumu ayırır."""
+        byb_tf = _interval_to_bybit(interval)
+        bar_ms = _interval_ms(interval)
+        now_ms = int(time.time() * 1000)
+        url = f"{self.bybit_api_base}/v5/market/kline"
+        resp = self._http.get(
+            url,
+            params={"category": "linear", "symbol": rest_symbol, "interval": byb_tf, "limit": limit},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if int(data.get("retCode", -1)) != 0:
+            raise RuntimeError(f"Bybit kline hatası ({rest_symbol}): {data.get('retMsg')}")
+
+        rows = (data.get("result") or {}).get("list") or []
+        closed: list[dict[str, float]] = []
+        forming: Optional[dict[str, float]] = None
+        for row in rows:
+            ts = int(row[0])
+            bar = {
+                "t": ts,
+                "o": float(row[1]),
+                "h": float(row[2]),
+                "l": float(row[3]),
+                "c": float(row[4]),
+                "v": float(row[5]),
+            }
+            if ts + bar_ms > now_ms:
+                if forming is None or ts > forming["t"]:
+                    forming = bar
+            else:
+                closed.append(bar)
+        closed.sort(key=lambda x: x["t"])
+        return closed, forming
+
+    def _run_quant_loop(self) -> None:
+        logger.info(
+            "Bybit Quant Dual-Alpha (%s | %s) motoru başlatılıyor: %s",
+            self.quant_mode,
+            self.tv_interval,
+            ", ".join(self.tv_symbols),
+        )
+        self._update_status(running=True, state=f"Bybit Quant ({self.quant_mode}) başlatılıyor...")
+        poll_interval = max(8.0, self.poll_sec)
+
+        while not self._stop_event.is_set():
+            try:
+                self._quant_step()
+            except Exception as exc:
+                logger.warning("Quant döngüsü uyarısı: %s", exc)
+                self._update_status(last_error=str(exc))
+            self._stop_event.wait(poll_interval)
+
+        self._update_status(running=False, state="Durduruldu")
+
+    def _quant_step(self) -> None:
+        btc_closed, btc_forming = self._fetch_bybit_klines_sync("BTCUSDT", self.tv_interval, limit=650)
+        if len(btc_closed) < 250:
+            raise RuntimeError(f"BTCUSDT mum sayısı yetersiz ({len(btc_closed)})")
+
+        btc_closes = [b["c"] for b in btc_closed]
+        btc_ema200 = _calc_ema(btc_closes, 200)
+        btc_close = btc_closes[-1]
+        btc_e200 = btc_ema200[-1]
+        btc_bull = btc_close > btc_e200
+        btc_bear = btc_close < btc_e200
+
+        for sym in self.tv_symbols:
+            if self._stop_event.is_set():
+                break
+            state = self._coin_states[sym]
+            rest_sym = state["bybit_rest_symbol"]
+            try:
+                if rest_sym == "BTCUSDT":
+                    closed, forming = btc_closed, btc_forming
+                else:
+                    closed, forming = self._fetch_bybit_klines_sync(rest_sym, self.tv_interval, limit=650)
+                if len(closed) < 250:
+                    continue
+                self._evaluate_quant_symbol(sym, state, closed, forming, btc_bull, btc_bear, btc_close, btc_e200)
+            except Exception as exc:
+                logger.warning("Quant sembol tarama hatası (%s): %s", sym, exc)
+                state["last_error"] = str(exc)
+
+        regime_txt = "🟢 BOĞA (BTC > EMA200)" if btc_bull else ("🔴 AYI (BTC < EMA200)" if btc_bear else "⚪ NÖTR")
+        self._sync_coins_status(
+            state_label=f"Quant {self.quant_mode} ({len(self.tv_symbols)} coin · {regime_txt})"
+        )
+
+    def _evaluate_quant_symbol(
+        self,
+        sym: str,
+        state: dict[str, Any],
+        closed_bars: list[dict[str, float]],
+        forming_bar: Optional[dict[str, float]],
+        btc_bull: bool,
+        btc_bear: bool,
+        btc_close: float,
+        btc_e200: float,
+    ) -> None:
+        n = len(closed_bars)
+        closes = [b["c"] for b in closed_bars]
+        vols = [b["v"] for b in closed_bars]
+        atr14 = _calc_atr(closed_bars, 14)
+        atr20 = _calc_atr(closed_bars, 20)
+        ema50 = _calc_ema(closes, 50)
+        ema200 = _calc_ema(closes, 200)
+        sma20 = _calc_sma(closes, 20)
+        sd20 = _calc_stdev(closes, sma20, 20)
+        bb_up = [sma20[i] + 2.0 * sd20[i] for i in range(n)]
+        bb_lo = [sma20[i] - 2.0 * sd20[i] for i in range(n)]
+        ema20 = _calc_ema(closes, 20)
+        kc_up = [ema20[i] + 1.5 * atr14[i] for i in range(n)]
+        kc_lo = [ema20[i] - 1.5 * atr14[i] for i in range(n)]
+        vol_sma20 = _calc_sma(vols, 20)
+        adx14 = _calc_adx(closed_bars, 14)
+        st_dir6, st_line6 = _calc_supertrend(closed_bars, atr20, 6.0)
+
+        live_price = forming_bar["c"] if forming_bar else closes[-1]
+        state["live_price"] = live_price
+        state["indicator_detected"] = True
+        state["needs_login_hint"] = False
+        state["last_error"] = None
+        state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        last_closed_t = int(closed_bars[-1]["t"])
+
+        # 1. Açık Pozisyon Takibi (Sert SL -> TP1/TP2 -> 1.2R Breakeven Kilidi)
+        self._eval_quant_open_position(sym, state, closed_bars, forming_bar, live_price)
+
+        # 2. Yeni Giriş Sinyali (Yalnızca YENİ kapanan mumda)
+        sig_info: Optional[dict[str, Any]] = None
+        if state["last_closed_ts"] is None:
+            # Başlangıçta geçmiş mumdan geriye dönük sahte giriş açma; sıradaki yeni kapanışı bekle
+            state["last_closed_ts"] = last_closed_t
+        elif last_closed_t > state["last_closed_ts"]:
+            state["last_closed_ts"] = last_closed_t
+            sig_info = self._eval_quant_new_entry(
+                sym, state, closed_bars, atr14, ema50, ema200,
+                bb_up, bb_lo, kc_up, kc_lo, vol_sma20, adx14, st_dir6, st_line6,
+                btc_bull, btc_bear, live_price,
+            )
+
+        # Web paneli için canlı özet tablo verisi
+        c = closes[-1]
+        st_lbl = "🟢 YUKARI" if st_dir6[-1] == 1 else "🔴 AŞAĞI"
+        sqz_on = bb_up[-1] < kc_up[-1] and bb_lo[-1] > kc_lo[-1]
+        btc_lbl = "BOĞA" if btc_bull else ("AYI" if btc_bear else "NÖTR")
+        act = state.get("active_trade")
+        plan_status = "active" if act else "waiting"
+        plan_side = act["side"] if act else ("long" if st_dir6[-1] == 1 else "short")
+        state["parsed_table"] = {
+            "indicator_detected": True,
+            "verdict": f"{'BOĞA' if st_dir6[-1] == 1 else 'AYI'} · BTC {btc_lbl}",
+            "plan_side": plan_side,
+            "plan_status": plan_status,
+            "plan_status_text": f"🟢 AKTİF ({act.get('engine')})" if act else "⏳ Sinyal Bekleniyor",
+            "entry": act["entry"] if act else sig_info.get("entry") if sig_info else None,
+            "tp1": act["tp1"] if act else sig_info.get("tp1") if sig_info else None,
+            "tp2": act["tp2"] if act else sig_info.get("tp2") if sig_info else None,
+            "tp3": None,
+            "tp4": None,
+            "sl": act["sl"] if act else st_line6[-1],
+            "checked_tps": list(act.get("hit_tps") or []) if act else [],
+            "raw_lines": [
+                f"Quant Motor: {self.quant_mode} | Zaman: {self.tv_interval}dk",
+                f"BTC Rejimi: {btc_lbl} (BTC={btc_close:.1f} / EMA200={btc_e200:.1f})",
+                f"Supertrend(20,6): {st_lbl} (Çizgi={st_line6[-1]:.6g}) | EMA200={ema200[-1]:.6g}",
+                f"ADX(14): {adx14[-1]:.1f} | BB Squeeze: {'AKTİF ⏳' if sqz_on else 'AÇIK'} | Fiyat={c:.6g}",
+            ],
+        }
+
+    def _eval_quant_open_position(
+        self,
+        sym: str,
+        state: dict[str, Any],
+        closed_bars: list[dict[str, float]],
+        forming_bar: Optional[dict[str, float]],
+        live_price: float,
+    ) -> None:
+        active = state.get("active_trade")
+        if active is None:
+            return
+
+        sig_bar_t = int(active.get("signal_bar_t") or 0)
+        chk_t = int(active.get("checked_through_t") or 0)
+        check_bars = [b for b in closed_bars if b["t"] > sig_bar_t and b["t"] >= chk_t]
+        if forming_bar is not None and forming_bar["t"] > sig_bar_t and forming_bar["t"] >= chk_t:
+            check_bars.append(forming_bar)
+
+        a_side = active["side"]
+        engine_tag = f"Bybit Quant ({active.get('engine', self.quant_mode)})"
+        for bar in check_bars:
+            if state.get("active_trade") is None:
+                return
+            bar_t_sec = int(bar["t"] // 1000)
+            is_closed = (forming_bar is None) or (bar["t"] < forming_bar["t"])
+            sl_px = float(active["sl"])
+
+            # 1) Hard SL kontrolü (BE yeni kilitlendiyse aynı mumun eski fitiline değil canlı/kapanış fiyatına bak)
+            if active.get("be_locked_bar_t") == int(bar["t"]):
+                chk_px = bar["c"] if is_closed else live_price
+                sl_hit = (a_side == "long" and chk_px <= sl_px) or (a_side == "short" and chk_px >= sl_px)
+            else:
+                sl_hit = (a_side == "long" and bar["l"] <= sl_px) or (a_side == "short" and bar["h"] >= sl_px)
+            if sl_hit:
+                self._emit_event(
+                    sym, "stop", a_side, live_price or sl_px, active, bar_t_sec, [],
+                    extra_payload={"engine": active.get("engine")},
+                    source_label=engine_tag,
+                )
+                state["active_trade"] = None
+                return
+
+            # 2) TP1 (%50 Kâr Al + SL -> Giriş+%0.20 BE)
+            tp1_hit_now = False
+            if "tp1" not in active["hit_tps"]:
+                t1_hit = (a_side == "long" and bar["h"] >= active["tp1"]) or (a_side == "short" and bar["l"] <= active["tp1"])
+                if t1_hit:
+                    tp1_hit_now = True
+                    active["hit_tps"].append("tp1")
+                    active["be_locked"] = True
+                    active["be_locked_bar_t"] = int(bar["t"])
+                    be_sl = active["entry"] * (1.0020 if a_side == "long" else 0.9980)
+                    active["sl"] = be_sl
+                    self._emit_event(
+                        sym, "tp1", a_side, active["tp1"], active, bar_t_sec, [],
+                        close_pct=50, new_sl=be_sl,
+                        extra_payload={"engine": active.get("engine")},
+                        source_label=engine_tag,
+                    )
+
+            # 3) TP2 (Kalan %50 = Tam Kapanış)
+            if "tp1" in active["hit_tps"] and "tp2" not in active["hit_tps"]:
+                t2_hit = (a_side == "long" and bar["h"] >= active["tp2"]) or (a_side == "short" and bar["l"] <= active["tp2"])
+                if t2_hit:
+                    active["hit_tps"].append("tp2")
+                    self._emit_event(
+                        sym, "tp4", a_side, active["tp2"], active, bar_t_sec, [],
+                        close_pct=100, new_sl=None,
+                        extra_payload={"engine": active.get("engine")},
+                        source_label=engine_tag,
+                    )
+                    state["active_trade"] = None
+                    return
+
+            # 4) 1.2R Erken Breakeven Kilidi (%0 kapatma, SL -> Giriş+%0.20)
+            be_hit_now = False
+            if "tp1" not in active["hit_tps"] and not active.get("be_locked"):
+                be_trig = float(active.get("be_trigger") or 0.0)
+                if be_trig > 0 and ((a_side == "long" and bar["h"] >= be_trig) or (a_side == "short" and bar["l"] <= be_trig)):
+                    be_hit_now = True
+                    active["be_locked"] = True
+                    active["be_locked_bar_t"] = int(bar["t"])
+                    be_sl = active["entry"] * (1.0020 if a_side == "long" else 0.9980)
+                    active["sl"] = be_sl
+                    self._emit_event(
+                        sym, "tp1", a_side, live_price, active, bar_t_sec, [],
+                        close_pct=0, new_sl=be_sl,
+                        extra_payload={"engine": active.get("engine")},
+                        source_label=engine_tag,
+                    )
+
+            # Muhafazakâr kapanış kontrolü: aynı kapalı mumda BE/TP1 görülüp kapanışta BE delindiyse kapat
+            if is_closed and (tp1_hit_now or be_hit_now):
+                be_broken = (a_side == "long" and bar["c"] <= active["sl"]) or (a_side == "short" and bar["c"] >= active["sl"])
+                if be_broken:
+                    self._emit_event(
+                        sym, "stop", a_side, bar["c"], active, bar_t_sec, [],
+                        extra_payload={"engine": active.get("engine")},
+                        source_label=engine_tag,
+                    )
+                    state["active_trade"] = None
+                    return
+
+            active["checked_through_t"] = int(bar["t"])
+
+    def _eval_quant_new_entry(
+        self,
+        sym: str,
+        state: dict[str, Any],
+        closed_bars: list[dict[str, float]],
+        atr14: list[float],
+        ema50: list[float],
+        ema200: list[float],
+        bb_up: list[float],
+        bb_lo: list[float],
+        kc_up: list[float],
+        kc_lo: list[float],
+        vol_sma20: list[float],
+        adx14: list[float],
+        st_dir6: list[int],
+        st_line6: list[float],
+        btc_bull: bool,
+        btc_bear: bool,
+        live_price: float,
+    ) -> Optional[dict[str, Any]]:
+        if state.get("active_trade") is not None:
+            return None
+
+        n = len(closed_bars)
+        b = closed_bars[-1]
+        c = b["c"]
+        if c <= 0 or atr14[-1] <= 0:
+            return None
+
+        picked: Optional[dict[str, Any]] = None
+
+        # Motor 1: Geniş Supertrend(20, 6.0) + EMA200 + BTC Rejim Filtresi
+        if st_dir6[-1] != st_dir6[-2]:
+            sl_dist = min(max(abs(c - st_line6[-1]), c * 0.012), c * 0.030)
+            if st_dir6[-1] == 1 and c > ema200[-1] and btc_bull:
+                picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
+            elif st_dir6[-1] == -1 and c < ema200[-1] and btc_bear:
+                picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
+
+        # Motor 2: BB/KC Sıkışma Patlaması + ADX>=22 + Hacim>=1.8x + 36-bar Kırılım + BTC Rejim
+        if picked is None and self.quant_mode != "ST_ONLY" and vol_sma20[-1] > 0:
+            sqz_prev = any(bb_up[k] < kc_up[k] and bb_lo[k] > kc_lo[k] for k in range(n - 9, n - 1))
+            released = not (bb_up[-1] < kc_up[-1] and bb_lo[-1] > kc_lo[-1])
+            if sqz_prev and released and b["v"] >= 1.8 * vol_sma20[-1] and adx14[-1] >= 22.0:
+                hi36 = max(closed_bars[k]["h"] for k in range(n - 37, n - 1))
+                lo36 = min(closed_bars[k]["l"] for k in range(n - 37, n - 1))
+                sl_dist = min(max(2.0 * atr14[-1], c * 0.012), c * 0.025)
+                if btc_bull and c > bb_up[-1] and c > hi36 and c > ema50[-1] > ema200[-1]:
+                    picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
+                elif btc_bear and c < bb_lo[-1] and c < lo36 and c < ema50[-1] < ema200[-1]:
+                    picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
+
+        if picked is None:
+            return None
+
+        side = picked["side"]
+        sd = picked["sl_dist"]
+        entry_px = live_price or c
+        if side == "long":
+            sl_p = entry_px - sd
+            be_trig = entry_px + sd * 1.2
+            tp1_p = entry_px + sd * picked["tp1_r"]
+            tp2_p = entry_px + sd * picked["tp2_r"]
+        else:
+            sl_p = entry_px + sd
+            be_trig = entry_px - sd * 1.2
+            tp1_p = entry_px - sd * picked["tp1_r"]
+            tp2_p = entry_px - sd * picked["tp2_r"]
+
+        self._trade_seq += 1
+        bar_t_sec = int(b["t"] // 1000)
+        plan = {
+            "trade_id": self._trade_seq,
+            "side": side,
+            "engine": picked["engine"],
+            "entry": entry_px,
+            "tp1": tp1_p,
+            "tp2": tp2_p,
+            "tp3": tp2_p,
+            "tp4": tp2_p,
+            "sl": sl_p,
+            "be_trigger": be_trig,
+            "be_locked": False,
+            "hit_tps": [],
+            "signal_bar_t": int(b["t"]),
+            "checked_through_t": int(b["t"]),
+            "opened_candle_ms": int(b["t"]),
+        }
+        state["active_trade"] = plan
+        res = self._emit_event(
+            sym, "entry", side, entry_px, plan, bar_t_sec, [],
+            extra_payload={
+                "hard_sl": True,
+                "close_pct": [50, 50, 0, 0],
+                "leverage": _tf_sim_leverage(self.tv_interval, self.default_leverage),
+                "engine": picked["engine"],
+            },
+            source_label=f"Bybit Quant ({picked['engine']})",
+        )
+        if isinstance(res, dict) and res.get("status") in ("skipped", "rejected"):
+            logger.info("%s girişi bot tarafından atlandı (%s), aktif takip temizlendi.", sym, res.get("reason"))
+            state["active_trade"] = None
+            return None
+        return plan
