@@ -87,7 +87,7 @@ class Config:
     MARGIN_USDT: float = _env_float("MARGIN_USDT", 10.0)
     DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 20)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 20)
-    MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 3)
+    MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 0)
     AUTO_TF_LEVERAGE: bool = _env_bool("AUTO_TF_LEVERAGE", True)
     EMERGENCY_HARD_SL_PCT: float = _env_float("EMERGENCY_HARD_SL_PCT", 0.0)
 
@@ -1439,6 +1439,7 @@ def _render_dashboard_html() -> str:
         if Config.ENGINE_MODE != "PSL_TV"
         else "PSL AI v2.1 (TradingView WebSocket)"
     )
+    max_open_label = f"Maks {Config.MAX_OPEN_POSITIONS}" if Config.MAX_OPEN_POSITIONS > 0 else "Sınırsız"
 
     coins_dict = status.get("coins") or {}
     if coins_dict:
@@ -1503,7 +1504,7 @@ def _render_dashboard_html() -> str:
         <div class="row"><span class="lbl">Cüzdan Bakiyesi</span><span class="val">{esc(balance_text)}</span></div>
         <div class="row"><span class="lbl">Çalışma Modu</span><span class="val">{esc(mode_label)}</span></div>
         <div class="row"><span class="lbl">İşlem Başı Marjin</span><span class="val">{Config.MARGIN_USDT} USDT</span></div>
-        <div class="row"><span class="lbl">Maks. Kaldıraç / Eşzamanlı İşlem</span><span class="val">{Config.MAX_LEVERAGE}x · Maks {Config.MAX_OPEN_POSITIONS}</span></div>
+        <div class="row"><span class="lbl">Maks. Kaldıraç / Eşzamanlı İşlem</span><span class="val">{Config.MAX_LEVERAGE}x · {max_open_label}</span></div>
         <div class="row"><span class="lbl">Otomatik Zaman Dilimi Kaldıracı</span><span class="val">{esc(tf_lev_text)}</span></div>
         <div class="row"><span class="lbl">Strateji Motoru</span><span class="val">{esc(engine_title)} ({esc(status.get('state'))})</span></div>
         <div class="row"><span class="lbl">Mail (IMAP)</span><span class="val">{'Aktif' if Config.ENABLE_IMAP else 'Kapalı'}</span></div>
@@ -1588,6 +1589,7 @@ async def lifespan(_: FastAPI):
     if Config.PUBLIC_URL:
         startup_rows.append([{"text": "🖥️ Canlı Bot Paneli", "url": Config.PUBLIC_URL}])
 
+    max_open_str = f"{Config.MAX_OPEN_POSITIONS} işlem" if Config.MAX_OPEN_POSITIONS > 0 else "Sınırsız"
     send_telegram(
         f"✅ <b>{bot_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -1598,7 +1600,7 @@ async def lifespan(_: FastAPI):
         f"<code>{html.escape(coins_preview)}</code>\n\n"
         f"⚙️ <b>Risk & Motor Ayarları</b>\n"
         f"├ <b>Marjin / İşlem:</b> <code>{Config.MARGIN_USDT:g} USDT</code>\n"
-        f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{Config.MAX_LEVERAGE}x</code> · <code>{Config.MAX_OPEN_POSITIONS} işlem</code>\n"
+        f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{Config.MAX_LEVERAGE}x</code> · <code>{max_open_str}</code>\n"
         f"└ <b>Motor:</b> {tv_status_label}",
         reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,
     )
