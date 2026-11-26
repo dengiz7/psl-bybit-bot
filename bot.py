@@ -84,6 +84,7 @@ class Config:
 
     # Risk & Pozisyon Ayarları
     DRY_RUN: bool = _env_bool("DRY_RUN", False)
+    MARGIN_PCT: float = _env_float("MARGIN_PCT", 5.0)
     MARGIN_USDT: float = _env_float("MARGIN_USDT", 10.0)
     DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 20)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 20)
@@ -102,7 +103,7 @@ class Config:
 
     # Veri Akışı (Bybit Quant Dual-Alpha veya TradingView WebSocket)
     ENGINE_MODE: str = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
-    QUANT_MODE: str = os.getenv("QUANT_MODE", "DUAL").strip().upper()
+    QUANT_MODE: str = os.getenv("QUANT_MODE", "VELEZ_ULTRA").strip().upper()
     ENABLE_PLAYWRIGHT: bool = _env_bool("ENABLE_PLAYWRIGHT", True)
     TV_CHART_URL: str = os.getenv("TV_CHART_URL", "").strip()
     TV_SYMBOL: str = os.getenv("TV_SYMBOL", "BYBIT:BTCUSDT.P").strip()
@@ -486,6 +487,9 @@ class BybitTrader:
         self._exchange: Optional[ccxt.bybit] = None
         self.account_mode_name: str = "DRY-RUN"
         self.usdt_balance: Optional[float] = None
+        self.usdt_wallet: Optional[float] = None
+        self.usdt_upnl: Optional[float] = None
+        self.usdt_available: Optional[float] = None
         self.connected: bool = False
 
         if Config.DRY_RUN:
@@ -507,12 +511,21 @@ class BybitTrader:
         for mode_key, mode_label in modes:
             client = self._build_client(mode_key)
             try:
-                bal = self._fetch_unified_usdt_balance(client)
+                snap = self._fetch_unified_account_snapshot(client)
                 self._exchange = client
                 self.account_mode_name = mode_label
-                self.usdt_balance = bal
+                self.usdt_balance = snap["equity"]
+                self.usdt_wallet = snap["wallet"]
+                self.usdt_upnl = snap["upnl"]
+                self.usdt_available = snap["available"]
                 self.connected = True
-                logger.info("Bybit bağlantısı başarılı: %s | Bakiye: %.2f USDT", mode_label, bal)
+                logger.info(
+                    "Bybit bağlantısı başarılı: %s | Toplam Kasa (Equity): %.2f USDT (Cüzdan: %.2f, Açık: %+.2f)",
+                    mode_label,
+                    snap["equity"],
+                    snap["wallet"],
+                    snap["upnl"],
+                )
                 break
             except Exception as exc:
                 last_err = exc
@@ -556,25 +569,47 @@ class BybitTrader:
         return client
 
     @staticmethod
-    def _fetch_unified_usdt_balance(client: ccxt.bybit) -> float:
+    def _fetch_unified_account_snapshot(client: ccxt.bybit) -> dict[str, float]:
         resp = client.private_get_v5_account_wallet_balance({"accountType": "UNIFIED"})
         accounts = ((resp.get("result") or {}).get("list")) or []
         for acc in accounts:
+            total_eq_raw = acc.get("totalEquity")
+            total_wb_raw = acc.get("totalWalletBalance")
+            total_upl_raw = acc.get("totalPerpUPL")
+            total_av_raw = acc.get("totalAvailableBalance")
+            coin_wb = coin_eq = coin_upl = coin_av = None
             for coin_info in acc.get("coin") or []:
                 if str(coin_info.get("coin", "")).upper() == "USDT":
-                    val = coin_info.get("walletBalance") or coin_info.get("equity") or 0
-                    return float(val)
-            total_eq = acc.get("totalEquity") or acc.get("totalWalletBalance")
-            if total_eq is not None:
-                return float(total_eq)
-        return 0.0
+                    if coin_info.get("walletBalance") not in (None, ""):
+                        coin_wb = float(coin_info["walletBalance"])
+                    if coin_info.get("equity") not in (None, ""):
+                        coin_eq = float(coin_info["equity"])
+                    if coin_info.get("unrealisedPnl") not in (None, ""):
+                        coin_upl = float(coin_info["unrealisedPnl"])
+                    if coin_info.get("availableToWithdraw") not in (None, ""):
+                        coin_av = float(coin_info["availableToWithdraw"])
+                    break
+            wallet = float(total_wb_raw) if total_wb_raw not in (None, "") else (coin_wb or 0.0)
+            equity = float(total_eq_raw) if total_eq_raw not in (None, "") else (coin_eq if coin_eq is not None else wallet)
+            upnl = float(total_upl_raw) if total_upl_raw not in (None, "") else (coin_upl if coin_upl is not None else (equity - wallet))
+            available = float(total_av_raw) if total_av_raw not in (None, "") else (coin_av if coin_av is not None else max(0.0, equity))
+            return {"equity": equity, "wallet": wallet, "upnl": upnl, "available": available}
+        return {"equity": 0.0, "wallet": 0.0, "upnl": 0.0, "available": 0.0}
+
+    @classmethod
+    def _fetch_unified_usdt_balance(cls, client: ccxt.bybit) -> float:
+        return cls._fetch_unified_account_snapshot(client)["equity"]
 
     def refresh_balance(self) -> Optional[float]:
-        """Bybit Unified cüzdandaki güncel USDT bakiyesini yeniler."""
+        """Bybit Unified cüzdandaki güncel toplam USDT kasasını (Equity) yeniler."""
         if Config.DRY_RUN or self._exchange is None:
             return self.usdt_balance
         try:
-            self.usdt_balance = self._fetch_unified_usdt_balance(self._exchange)
+            snap = self._fetch_unified_account_snapshot(self._exchange)
+            self.usdt_balance = snap["equity"]
+            self.usdt_wallet = snap["wallet"]
+            self.usdt_upnl = snap["upnl"]
+            self.usdt_available = snap["available"]
         except Exception as exc:
             logger.debug("Bakiye yenilenemedi: %s", exc)
         return self.usdt_balance
@@ -787,10 +822,44 @@ class BybitTrader:
     def _engine_footer(payload: dict[str, Any], trade_state: Optional[dict[str, Any]] = None, source: str = "") -> str:
         eng = payload.get("engine") or (trade_state or {}).get("engine")
         if eng:
-            return f"Quant Dual-Alpha ({html.escape(str(eng))})"
+            eng_str = str(eng)
+            if eng_str.startswith("VELEZ"):
+                return f"Velez PCT Ultra ({html.escape(eng_str)})"
+            return f"Quant Dual-Alpha ({html.escape(eng_str)})"
+        if "Velez" in source:
+            return "Velez PCT Ultra"
         if "Quant" in source:
             return "Quant Dual-Alpha"
         return "PSL AI v2.1"
+
+    def _resolve_trade_margin(self) -> tuple[float, str]:
+        """İşlem başı kullanılacak marjini hesaplar (MARGIN_PCT > 0 ise Toplam Kasanın yüzdesi)."""
+        if Config.MARGIN_PCT > 0:
+            if Config.DRY_RUN or self._exchange is None:
+                eq = float(self.usdt_balance or 100.0)
+                m = round(eq * (Config.MARGIN_PCT / 100.0), 2)
+                return m, f"{m:.2f} USDT (%{Config.MARGIN_PCT:g} Kasa)"
+
+            self.refresh_balance()
+            eq = float(self.usdt_balance or 0.0)
+            avail = float(self.usdt_available if self.usdt_available is not None else eq)
+            if eq <= 0:
+                return Config.MARGIN_USDT, f"{Config.MARGIN_USDT:g} USDT"
+
+            target_m = eq * (Config.MARGIN_PCT / 100.0)
+            usable_m = min(target_m, avail * 0.95)
+            if usable_m < 1.0:
+                logger.warning(
+                    "Yetersiz boş marjin (Toplam Kasa=%.2f, Boş=%.2f, Hedef=%.2f USDT), giriş atlandı.",
+                    eq,
+                    avail,
+                    target_m,
+                )
+                return 0.0, ""
+            usable_m = round(usable_m, 2)
+            return usable_m, f"{usable_m:.2f} USDT (%{Config.MARGIN_PCT:g} Kasa)"
+
+        return Config.MARGIN_USDT, f"{Config.MARGIN_USDT:g} USDT"
 
     def _handle_entry(
         self,
@@ -844,7 +913,11 @@ class BybitTrader:
             logger.error("Geçerli fiyat bulunamadı (%s), giriş iptal.", symbol)
             return "skipped_price"
 
-        notional = Config.MARGIN_USDT * leverage
+        trade_margin, margin_label = self._resolve_trade_margin()
+        if trade_margin <= 0:
+            return "skipped_margin"
+
+        notional = trade_margin * leverage
         raw_qty = notional / ref_price
         qty = self._format_amount(symbol, raw_qty)
         if qty <= 0:
@@ -891,7 +964,7 @@ class BybitTrader:
             "hard_sl": bool(payload.get("hard_sl")),
             "be_locked": False,
             "leverage": leverage,
-            "margin_usdt": Config.MARGIN_USDT,
+            "margin_usdt": trade_margin,
             "initial_qty": qty,
             "remaining_qty": qty,
             "close_pct": close_pct,
@@ -934,7 +1007,7 @@ class BybitTrader:
             f"{side_header}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🪙 <b>Parite:</b> <code>#{ticker}</code> · <b>{html.escape(tf_label)}</b>\n"
-            f"⚡ <b>Kaldıraç:</b> <code>{leverage}x</code> · <b>Marjin:</b> <code>{Config.MARGIN_USDT:g} USDT</code> (~{notional:.0f} USDT)\n"
+            f"⚡ <b>Kaldıraç:</b> <code>{leverage}x</code> · <b>Marjin:</b> <code>{html.escape(margin_label)}</code> (~{notional:.0f} USDT)\n"
             f"📦 <b>Miktar:</b> <code>{_fmt_qty(qty)}</code>\n\n"
             f"📍 <b>Giriş Fiyatı:</b> <code>{_fmt_price(entry_px)}</code>\n"
             f"🛑 <b>Stop Loss (SL):</b> <code>{_fmt_price(sl_val)}</code>{sl_pct}{sl_badge}\n\n"
@@ -1411,13 +1484,17 @@ def _render_dashboard_html() -> str:
 
     bybit_conn_text = "❌ Bağlı Değil"
     balance_text = "-"
+    bal: Optional[float] = None
     if Config.DRY_RUN:
         bybit_conn_text = "🧪 Simülasyon (DRY-RUN)"
     elif trader and trader.connected:
         bybit_conn_text = f"✅ Bağlı ({trader.account_mode_name})"
         bal = trader.refresh_balance()
         if bal is not None:
-            balance_text = f"{bal:.2f} USDT"
+            if trader.usdt_wallet is not None and trader.usdt_upnl is not None and abs(trader.usdt_upnl) >= 0.01:
+                balance_text = f"{bal:.2f} USDT (Cüzdan: {trader.usdt_wallet:.2f} · Açık: {trader.usdt_upnl:+.2f})"
+            else:
+                balance_text = f"{bal:.2f} USDT"
 
     esc = lambda v: html.escape(str(v)) if v not in (None, "") else "-"
     login_banner = ""
@@ -1435,11 +1512,24 @@ def _render_dashboard_html() -> str:
         else f"Kapalı (Sabit {Config.DEFAULT_LEVERAGE}x)"
     )
     engine_title = (
-        f"Quant 5dk Dual-Alpha ({Config.QUANT_MODE})"
-        if Config.ENGINE_MODE != "PSL_TV"
-        else "PSL AI v2.1 (TradingView WebSocket)"
+        "Velez PCT Ultra (Optimum ST6)"
+        if Config.ENGINE_MODE != "PSL_TV" and Config.QUANT_MODE == "VELEZ_ULTRA"
+        else (
+            f"Quant 5dk Dual-Alpha ({Config.QUANT_MODE})"
+            if Config.ENGINE_MODE != "PSL_TV"
+            else "PSL AI v2.1 (TradingView WebSocket)"
+        )
     )
     max_open_label = f"Maks {Config.MAX_OPEN_POSITIONS}" if Config.MAX_OPEN_POSITIONS > 0 else "Sınırsız"
+    if Config.MARGIN_PCT > 0:
+        est_part = (
+            f" (~{bal * Config.MARGIN_PCT / 100.0:.2f} USDT)"
+            if (trader and trader.connected and bal is not None and not Config.DRY_RUN)
+            else ""
+        )
+        margin_cfg_text = f"Kasanın %{Config.MARGIN_PCT:g}'u{est_part}"
+    else:
+        margin_cfg_text = f"{Config.MARGIN_USDT:g} USDT"
 
     coins_dict = status.get("coins") or {}
     if coins_dict:
@@ -1494,16 +1584,16 @@ def _render_dashboard_html() -> str:
 </head>
 <body>
   <div class="wrap">
-    <h1>🤖 PSL AI v2.1 — Bybit Bulut Bot Paneli</h1>
+    <h1>🤖 {esc(engine_title)} — Bybit Bulut Bot Paneli</h1>
     <div class="sub">Sayfa 10 saniyede bir otomatik yenilenir · Canlı Durum</div>
     {login_banner}
     <div class="grid">
       <div class="card">
         <h2>⚙️ Bot ve Bybit Ayarları</h2>
         <div class="row"><span class="lbl">Bybit Bağlantısı</span><span class="val">{esc(bybit_conn_text)}</span></div>
-        <div class="row"><span class="lbl">Cüzdan Bakiyesi</span><span class="val">{esc(balance_text)}</span></div>
+        <div class="row"><span class="lbl">Toplam Kasa (Equity)</span><span class="val">{esc(balance_text)}</span></div>
         <div class="row"><span class="lbl">Çalışma Modu</span><span class="val">{esc(mode_label)}</span></div>
-        <div class="row"><span class="lbl">İşlem Başı Marjin</span><span class="val">{Config.MARGIN_USDT} USDT</span></div>
+        <div class="row"><span class="lbl">İşlem Başı Marjin</span><span class="val">{esc(margin_cfg_text)}</span></div>
         <div class="row"><span class="lbl">Maks. Kaldıraç / Eşzamanlı İşlem</span><span class="val">{Config.MAX_LEVERAGE}x · {max_open_label}</span></div>
         <div class="row"><span class="lbl">Otomatik Zaman Dilimi Kaldıracı</span><span class="val">{esc(tf_lev_text)}</span></div>
         <div class="row"><span class="lbl">Strateji Motoru</span><span class="val">{esc(engine_title)} ({esc(status.get('state'))})</span></div>
@@ -1557,20 +1647,38 @@ async def lifespan(_: FastAPI):
         _imap_thread.start()
 
     mode = _bot_mode_label()
-    bal_str = f"{trader.usdt_balance:.2f} USDT" if trader.usdt_balance is not None else "—"
+    bal_val = trader.usdt_balance
+    if (
+        bal_val is not None
+        and trader.usdt_wallet is not None
+        and trader.usdt_upnl is not None
+        and abs(trader.usdt_upnl) >= 0.01
+    ):
+        bal_str = f"{bal_val:.2f} USDT (Cüzdan: {trader.usdt_wallet:.2f} | Açık: {trader.usdt_upnl:+.2f})"
+    else:
+        bal_str = f"{bal_val:.2f} USDT" if bal_val is not None else "—"
+
     raw_symbols = [s.strip() for s in Config.TV_SYMBOL.split(",") if s.strip()]
     clean_bases = [_ticker_base(s) for s in raw_symbols]
     coins_preview = " · ".join(clean_bases) if clean_bases else "—"
     tf_label = _format_tf_label(Config.TV_INTERVAL)
     tv_status_label = (
-        f"🟢 Bybit Quant ({Config.QUANT_MODE})"
-        if Config.ENGINE_MODE != "PSL_TV"
-        else ("🟢 TradingView WebSocket" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı")
+        "🟢 Velez PCT Ultra (Optimum ST6)"
+        if Config.ENGINE_MODE != "PSL_TV" and Config.QUANT_MODE == "VELEZ_ULTRA"
+        else (
+            f"🟢 Bybit Quant ({Config.QUANT_MODE})"
+            if Config.ENGINE_MODE != "PSL_TV"
+            else ("🟢 TradingView WebSocket" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı")
+        )
     )
     bot_title = (
-        "BYBIT QUANT 5DK DUAL-ALPHA BOT AKTİF"
-        if Config.ENGINE_MODE != "PSL_TV"
-        else "PSL AI BYBIT BOT AKTİF"
+        "VELEZ PCT ULTRA — BYBIT BOT AKTİF"
+        if Config.ENGINE_MODE != "PSL_TV" and Config.QUANT_MODE == "VELEZ_ULTRA"
+        else (
+            "BYBIT QUANT 5DK DUAL-ALPHA BOT AKTİF"
+            if Config.ENGINE_MODE != "PSL_TV"
+            else "PSL AI BYBIT BOT AKTİF"
+        )
     )
 
     startup_rows: list[list[dict[str, str]]] = []
@@ -1590,16 +1698,21 @@ async def lifespan(_: FastAPI):
         startup_rows.append([{"text": "🖥️ Canlı Bot Paneli", "url": Config.PUBLIC_URL}])
 
     max_open_str = f"{Config.MAX_OPEN_POSITIONS} işlem" if Config.MAX_OPEN_POSITIONS > 0 else "Sınırsız"
+    if Config.MARGIN_PCT > 0:
+        est_m = f" (~{bal_val * Config.MARGIN_PCT / 100.0:.2f} USDT)" if bal_val else ""
+        startup_margin_str = f"Kasanın %{Config.MARGIN_PCT:g}'u{est_m}"
+    else:
+        startup_margin_str = f"{Config.MARGIN_USDT:g} USDT"
     send_telegram(
         f"✅ <b>{bot_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🏦 <b>Hesap Modu:</b> <code>{html.escape(mode)}</code>\n"
-        f"💰 <b>Bakiye:</b> <code>{bal_str}</code>\n"
+        f"💰 <b>Toplam Kasa (Equity):</b> <code>{html.escape(bal_str)}</code>\n"
         f"⏱️ <b>Zaman Dilimi:</b> <code>{html.escape(tf_label)}</code>\n"
         f"🪙 <b>İzlenen Coinler ({len(clean_bases)}):</b>\n"
         f"<code>{html.escape(coins_preview)}</code>\n\n"
         f"⚙️ <b>Risk & Motor Ayarları</b>\n"
-        f"├ <b>Marjin / İşlem:</b> <code>{Config.MARGIN_USDT:g} USDT</code>\n"
+        f"├ <b>Marjin / İşlem:</b> <code>{html.escape(startup_margin_str)}</code>\n"
         f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{Config.MAX_LEVERAGE}x</code> · <code>{max_open_str}</code>\n"
         f"└ <b>Motor:</b> {tv_status_label}",
         reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,

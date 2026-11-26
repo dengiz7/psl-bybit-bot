@@ -25,7 +25,7 @@ import requests
 logger = logging.getLogger("psl-tv-watcher")
 
 ENGINE_MODE = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
-QUANT_MODE = os.getenv("QUANT_MODE", "DUAL").strip().upper()
+QUANT_MODE = os.getenv("QUANT_MODE", "VELEZ_ULTRA").strip().upper()
 
 PSL_SCRIPT_ID = "PUB;dc403b2eacfd4347a5e1b6244f203220"
 PSL_TRANSLATE_URL = f"https://pine-facade.tradingview.com/pine-facade/translate/{PSL_SCRIPT_ID}/last"
@@ -313,6 +313,82 @@ def _calc_supertrend(
             else:
                 dirs[i], line[i] = -1, f_ub[i]
     return dirs, line
+
+
+def _calc_velez_pct(
+    bars: list[dict[str, float]],
+    sma20: list[float],
+    sma200: list[float],
+    atr14: list[float],
+    color_len: int = 15,
+    slope_len: int = 3,
+    slope_min: float = 0.12,
+) -> tuple[int, int, dict[str, Any]]:
+    """Velez PCT (Position - Dominant Color - 20 SMA Trend) skorunu (0-3) hesaplar."""
+    n = len(bars)
+    meta = {
+        "pos_plus": False,
+        "pos_minus": False,
+        "dom_green": False,
+        "dom_red": False,
+        "trend_up": False,
+        "trend_down": False,
+    }
+    if n < max(205, color_len + slope_len + 2):
+        return 0, 0, meta
+
+    c = bars[-1]["c"]
+    s20 = sma20[-1]
+    s200 = sma200[-1]
+    atr = max(atr14[-1], 1e-12)
+
+    pos_plus = (c > s20) and (c > s200)
+    pos_minus = (c < s20) and (c < s200)
+
+    g_sum = r_sum = 0.0
+    g_cnt = r_cnt = 0
+    cg = cr = mg = mr = 0
+    for b in bars[n - color_len : n]:
+        bo, bc = b["o"], b["c"]
+        bb = abs(bc - bo)
+        if bc > bo:
+            g_sum += bb
+            g_cnt += 1
+            cg += 1
+            cr = 0
+            if cg > mg:
+                mg = cg
+        elif bc < bo:
+            r_sum += bb
+            r_cnt += 1
+            cr += 1
+            cg = 0
+            if cr > mr:
+                mr = cr
+        else:
+            cg = 0
+            cr = 0
+
+    g_score = int(g_sum > r_sum) + int(mg > mr) + int(g_cnt > r_cnt)
+    r_score = int(r_sum > g_sum) + int(mr > mg) + int(r_cnt > g_cnt)
+    dom_green = g_score >= 2
+    dom_red = r_score >= 2
+
+    s20_prev = sma20[-1 - slope_len]
+    trend_up = (s20 - s20_prev) > (atr * slope_min)
+    trend_down = (s20_prev - s20) > (atr * slope_min)
+
+    meta = {
+        "pos_plus": pos_plus,
+        "pos_minus": pos_minus,
+        "dom_green": dom_green,
+        "dom_red": dom_red,
+        "trend_up": trend_up,
+        "trend_down": trend_down,
+    }
+    pct_long = int(pos_plus) + int(dom_green) + int(trend_up)
+    pct_short = int(pos_minus) + int(dom_red) + int(trend_down)
+    return pct_long, pct_short, meta
 
 
 def parse_psl_table(lines: list[str]) -> dict[str, Any]:
@@ -1353,13 +1429,15 @@ class TradingViewPlaywrightWatcher:
         return closed, forming
 
     def _run_quant_loop(self) -> None:
+        mode_disp = "Velez PCT Ultra" if self.quant_mode == "VELEZ_ULTRA" else f"Quant {self.quant_mode}"
         logger.info(
-            "Bybit Quant Dual-Alpha (%s | %s) motoru başlatılıyor: %s",
+            "%s (%s | %s) motoru başlatılıyor: %s",
+            mode_disp,
             self.quant_mode,
             self.tv_interval,
             ", ".join(self.tv_symbols),
         )
-        self._update_status(running=True, state=f"Bybit Quant ({self.quant_mode}) başlatılıyor...")
+        self._update_status(running=True, state=f"{mode_disp} başlatılıyor...")
         poll_interval = max(8.0, self.poll_sec)
 
         while not self._stop_event.is_set():
@@ -1401,9 +1479,10 @@ class TradingViewPlaywrightWatcher:
                 logger.warning("Quant sembol tarama hatası (%s): %s", sym, exc)
                 state["last_error"] = str(exc)
 
+        mode_disp = "Velez PCT Ultra" if self.quant_mode == "VELEZ_ULTRA" else f"Quant {self.quant_mode}"
         regime_txt = "🟢 BOĞA (BTC > EMA200)" if btc_bull else ("🔴 AYI (BTC < EMA200)" if btc_bear else "⚪ NÖTR")
         self._sync_coins_status(
-            state_label=f"Quant {self.quant_mode} ({len(self.tv_symbols)} coin · {regime_txt})"
+            state_label=f"{mode_disp} ({len(self.tv_symbols)} coin · {regime_txt})"
         )
 
     def _evaluate_quant_symbol(
@@ -1425,6 +1504,7 @@ class TradingViewPlaywrightWatcher:
         ema50 = _calc_ema(closes, 50)
         ema200 = _calc_ema(closes, 200)
         sma20 = _calc_sma(closes, 20)
+        sma200 = _calc_sma(closes, 200)
         sd20 = _calc_stdev(closes, sma20, 20)
         bb_up = [sma20[i] + 2.0 * sd20[i] for i in range(n)]
         bb_lo = [sma20[i] - 2.0 * sd20[i] for i in range(n)]
@@ -1434,6 +1514,10 @@ class TradingViewPlaywrightWatcher:
         vol_sma20 = _calc_sma(vols, 20)
         adx14 = _calc_adx(closed_bars, 14)
         st_dir6, st_line6 = _calc_supertrend(closed_bars, atr20, 6.0)
+        is_velez = self.quant_mode == "VELEZ_ULTRA"
+        pct_long, pct_short, pct_meta = (
+            _calc_velez_pct(closed_bars, sma20, sma200, atr14) if is_velez else (0, 0, {})
+        )
 
         live_price = forming_bar["c"] if forming_bar else closes[-1]
         state["live_price"] = live_price
@@ -1457,7 +1541,7 @@ class TradingViewPlaywrightWatcher:
             sig_info = self._eval_quant_new_entry(
                 sym, state, closed_bars, atr14, ema50, ema200,
                 bb_up, bb_lo, kc_up, kc_lo, vol_sma20, adx14, st_dir6, st_line6,
-                btc_bull, btc_bear, live_price,
+                pct_long, pct_short, btc_bull, btc_bear, live_price,
             )
 
         # Web paneli için canlı özet tablo verisi
@@ -1468,9 +1552,30 @@ class TradingViewPlaywrightWatcher:
         act = state.get("active_trade")
         plan_status = "active" if act else "waiting"
         plan_side = act["side"] if act else ("long" if st_dir6[-1] == 1 else "short")
+        if is_velez:
+            pct_tag = (
+                f"AL {pct_long}/3"
+                if pct_meta.get("pos_plus")
+                else (f"SAT {pct_short}/3" if pct_meta.get("pos_minus") else "TUZAK 0/3")
+            )
+            verdict_text = f"{pct_tag} · BTC {btc_lbl}"
+            raw_lines = [
+                f"Motor: Velez PCT Ultra (Optimum ST6) | Zaman: {self.tv_interval}dk",
+                f"Velez PCT: {pct_tag} | SMA20={sma20[-1]:.6g} / SMA200={sma200[-1]:.6g}",
+                f"BTC Rejimi: {btc_lbl} (BTC={btc_close:.1f} / EMA200={btc_e200:.1f})",
+                f"Supertrend(20,6): {st_lbl} (SL Hattı={st_line6[-1]:.6g}) | ADX={adx14[-1]:.1f} | Fiyat={c:.6g}",
+            ]
+        else:
+            verdict_text = f"{'BOĞA' if st_dir6[-1] == 1 else 'AYI'} · BTC {btc_lbl}"
+            raw_lines = [
+                f"Quant Motor: {self.quant_mode} | Zaman: {self.tv_interval}dk",
+                f"BTC Rejimi: {btc_lbl} (BTC={btc_close:.1f} / EMA200={btc_e200:.1f})",
+                f"Supertrend(20,6): {st_lbl} (Çizgi={st_line6[-1]:.6g}) | EMA200={ema200[-1]:.6g}",
+                f"ADX(14): {adx14[-1]:.1f} | BB Squeeze: {'AKTİF ⏳' if sqz_on else 'AÇIK'} | Fiyat={c:.6g}",
+            ]
         state["parsed_table"] = {
             "indicator_detected": True,
-            "verdict": f"{'BOĞA' if st_dir6[-1] == 1 else 'AYI'} · BTC {btc_lbl}",
+            "verdict": verdict_text,
             "plan_side": plan_side,
             "plan_status": plan_status,
             "plan_status_text": f"🟢 AKTİF ({act.get('engine')})" if act else "⏳ Sinyal Bekleniyor",
@@ -1481,12 +1586,7 @@ class TradingViewPlaywrightWatcher:
             "tp4": None,
             "sl": act["sl"] if act else st_line6[-1],
             "checked_tps": list(act.get("hit_tps") or []) if act else [],
-            "raw_lines": [
-                f"Quant Motor: {self.quant_mode} | Zaman: {self.tv_interval}dk",
-                f"BTC Rejimi: {btc_lbl} (BTC={btc_close:.1f} / EMA200={btc_e200:.1f})",
-                f"Supertrend(20,6): {st_lbl} (Çizgi={st_line6[-1]:.6g}) | EMA200={ema200[-1]:.6g}",
-                f"ADX(14): {adx14[-1]:.1f} | BB Squeeze: {'AKTİF ⏳' if sqz_on else 'AÇIK'} | Fiyat={c:.6g}",
-            ],
+            "raw_lines": raw_lines,
         }
 
     def _eval_quant_open_position(
@@ -1508,7 +1608,8 @@ class TradingViewPlaywrightWatcher:
             check_bars.append(forming_bar)
 
         a_side = active["side"]
-        engine_tag = f"Bybit Quant ({active.get('engine', self.quant_mode)})"
+        prefix = "Velez PCT Ultra" if self.quant_mode == "VELEZ_ULTRA" else "Bybit Quant"
+        engine_tag = f"{prefix} ({active.get('engine', self.quant_mode)})"
         for bar in check_bars:
             if state.get("active_trade") is None:
                 return
@@ -1610,6 +1711,8 @@ class TradingViewPlaywrightWatcher:
         adx14: list[float],
         st_dir6: list[int],
         st_line6: list[float],
+        pct_long: int,
+        pct_short: int,
         btc_bull: bool,
         btc_bear: bool,
         live_price: float,
@@ -1625,26 +1728,38 @@ class TradingViewPlaywrightWatcher:
 
         picked: Optional[dict[str, Any]] = None
 
-        # Motor 1: Geniş Supertrend(20, 6.0) + EMA200 + BTC Rejim Filtresi
-        if st_dir6[-1] != st_dir6[-2]:
-            sl_dist = min(max(abs(c - st_line6[-1]), c * 0.012), c * 0.030)
-            if st_dir6[-1] == 1 and c > ema200[-1] and btc_bull:
-                picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
-            elif st_dir6[-1] == -1 and c < ema200[-1] and btc_bear:
-                picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
+        if self.quant_mode == "VELEZ_ULTRA":
+            # Optimum Velez PCT Ultra: Supertrend(20, 6.0) + Velez PCT >= 2/3 + BTC EMA200 (Sıkışma fakeout'ları kapalı)
+            bar_ms = _interval_ms(self.tv_interval)
+            min_sl_pct = 0.012 if bar_ms <= 300_000 else (0.015 if bar_ms <= 900_000 else 0.020)
+            max_sl_pct = 0.030 if bar_ms <= 300_000 else (0.035 if bar_ms <= 900_000 else 0.050)
+            if st_dir6[-1] != st_dir6[-2]:
+                sl_dist = min(max(abs(c - st_line6[-1]), c * min_sl_pct), c * max_sl_pct)
+                if st_dir6[-1] == 1 and pct_long >= 2 and btc_bull:
+                    picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": f"VELEZ_ST6_{pct_long}/3"}
+                elif st_dir6[-1] == -1 and pct_short >= 2 and btc_bear:
+                    picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": f"VELEZ_ST6_{pct_short}/3"}
+        else:
+            # Motor 1: Geniş Supertrend(20, 6.0) + EMA200 + BTC Rejim Filtresi
+            if st_dir6[-1] != st_dir6[-2]:
+                sl_dist = min(max(abs(c - st_line6[-1]), c * 0.012), c * 0.030)
+                if st_dir6[-1] == 1 and c > ema200[-1] and btc_bull:
+                    picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
+                elif st_dir6[-1] == -1 and c < ema200[-1] and btc_bear:
+                    picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 2.0, "tp2_r": 4.0, "engine": "ST20_M6"}
 
-        # Motor 2: BB/KC Sıkışma Patlaması + ADX>=22 + Hacim>=1.8x + 36-bar Kırılım + BTC Rejim
-        if picked is None and self.quant_mode != "ST_ONLY" and vol_sma20[-1] > 0:
-            sqz_prev = any(bb_up[k] < kc_up[k] and bb_lo[k] > kc_lo[k] for k in range(n - 9, n - 1))
-            released = not (bb_up[-1] < kc_up[-1] and bb_lo[-1] > kc_lo[-1])
-            if sqz_prev and released and b["v"] >= 1.8 * vol_sma20[-1] and adx14[-1] >= 22.0:
-                hi36 = max(closed_bars[k]["h"] for k in range(n - 37, n - 1))
-                lo36 = min(closed_bars[k]["l"] for k in range(n - 37, n - 1))
-                sl_dist = min(max(2.0 * atr14[-1], c * 0.012), c * 0.025)
-                if btc_bull and c > bb_up[-1] and c > hi36 and c > ema50[-1] > ema200[-1]:
-                    picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
-                elif btc_bear and c < bb_lo[-1] and c < lo36 and c < ema50[-1] < ema200[-1]:
-                    picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
+            # Motor 2: BB/KC Sıkışma Patlaması + ADX>=22 + Hacim>=1.8x + 36-bar Kırılım + BTC Rejim
+            if picked is None and self.quant_mode != "ST_ONLY" and vol_sma20[-1] > 0:
+                sqz_prev = any(bb_up[k] < kc_up[k] and bb_lo[k] > kc_lo[k] for k in range(n - 9, n - 1))
+                released = not (bb_up[-1] < kc_up[-1] and bb_lo[-1] > kc_lo[-1])
+                if sqz_prev and released and b["v"] >= 1.8 * vol_sma20[-1] and adx14[-1] >= 22.0:
+                    hi36 = max(closed_bars[k]["h"] for k in range(n - 37, n - 1))
+                    lo36 = min(closed_bars[k]["l"] for k in range(n - 37, n - 1))
+                    sl_dist = min(max(2.0 * atr14[-1], c * 0.012), c * 0.025)
+                    if btc_bull and c > bb_up[-1] and c > hi36 and c > ema50[-1] > ema200[-1]:
+                        picked = {"side": "long", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
+                    elif btc_bear and c < bb_lo[-1] and c < lo36 and c < ema50[-1] < ema200[-1]:
+                        picked = {"side": "short", "sl_dist": sl_dist, "tp1_r": 1.8, "tp2_r": 3.6, "engine": "SQZ36_ADX22"}
 
         if picked is None:
             return None
@@ -1683,6 +1798,7 @@ class TradingViewPlaywrightWatcher:
             "opened_candle_ms": int(b["t"]),
         }
         state["active_trade"] = plan
+        src_prefix = "Velez PCT Ultra" if self.quant_mode == "VELEZ_ULTRA" else "Bybit Quant"
         res = self._emit_event(
             sym, "entry", side, entry_px, plan, bar_t_sec, [],
             extra_payload={
@@ -1691,7 +1807,7 @@ class TradingViewPlaywrightWatcher:
                 "leverage": _tf_sim_leverage(self.tv_interval, self.default_leverage),
                 "engine": picked["engine"],
             },
-            source_label=f"Bybit Quant ({picked['engine']})",
+            source_label=f"{src_prefix} ({picked['engine']})",
         )
         if isinstance(res, dict) and res.get("status") in ("skipped", "rejected"):
             logger.info("%s girişi bot tarafından atlandı (%s), aktif takip temizlendi.", sym, res.get("reason"))
