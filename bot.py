@@ -139,13 +139,15 @@ class Config:
 def send_telegram(
     message: str,
     reply_markup: Optional[dict[str, Any]] = None,
+    chat_id: Optional[str] = None,
 ) -> bool:
     """Telegram üzerinden anlık işlem ve hata bildirimi gönderir."""
-    if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
+    target_chat = str(chat_id or Config.TELEGRAM_CHAT_ID).strip()
+    if not Config.TELEGRAM_BOT_TOKEN or not target_chat:
         return False
     url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload: dict[str, Any] = {
-        "chat_id": Config.TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -658,6 +660,91 @@ class BybitTrader:
         except Exception as exc:
             logger.warning("Açık pozisyon sayısı sorgulanamadı: %s", exc)
             return len(self._active_trades)
+
+    def get_open_positions_detailed(self) -> list[dict[str, Any]]:
+        """Bybit üzerindeki aktif açık pozisyonları özet detaylarıyla döndürür."""
+        if Config.DRY_RUN or self._exchange is None:
+            items: list[dict[str, Any]] = []
+            for sym, st in self._active_trades.items():
+                size = float(st.get("remaining_qty") or st.get("initial_qty") or 0.0)
+                if size <= 0:
+                    continue
+                entry_p = float(st.get("entry_price") or 0.0)
+                items.append(
+                    {
+                        "symbol": sym,
+                        "raw_symbol": _symbol_to_ticker(sym),
+                        "ticker": _symbol_to_ticker(sym),
+                        "side": str(st.get("side") or "long").lower(),
+                        "size": size,
+                        "entry_price": entry_p,
+                        "mark_price": entry_p,
+                        "stop_loss": float(st.get("sl") or 0.0),
+                        "leverage": int(st.get("leverage") or Config.DEFAULT_LEVERAGE),
+                        "upnl": 0.0,
+                        "position_im": float(st.get("margin_usdt") or 0.0),
+                    }
+                )
+            return items
+
+        resp = self._exchange.private_get_v5_position_list({"category": "linear", "settleCoin": "USDT"})
+        raw_list = ((resp.get("result") or {}).get("list")) or []
+        out: list[dict[str, Any]] = []
+        for pos in raw_list:
+            size = float(pos.get("size") or 0.0)
+            if size <= 0:
+                continue
+            raw_sym = str(pos.get("symbol") or "").strip().upper()
+            side = "long" if str(pos.get("side") or "").lower() == "buy" else "short"
+            out.append(
+                {
+                    "symbol": normalize_symbol(raw_sym),
+                    "raw_symbol": raw_sym,
+                    "ticker": _symbol_to_ticker(raw_sym),
+                    "side": side,
+                    "size": size,
+                    "entry_price": float(pos.get("avgPrice") or 0.0),
+                    "mark_price": float(pos.get("markPrice") or 0.0),
+                    "stop_loss": float(pos.get("stopLoss") or 0.0),
+                    "leverage": int(float(pos.get("leverage") or 1)),
+                    "upnl": float(pos.get("unrealisedPnl") or 0.0),
+                    "position_im": float(pos.get("positionIM") or 0.0),
+                }
+            )
+        return out
+
+    def close_position_by_query(self, target: str) -> list[dict[str, Any]]:
+        """Telegram /kapat komutuyla tek bir coini veya tüm pozisyonları piyasa emriyle kapatır."""
+        q = target.strip().upper().replace("/", "").replace(":USDT", "").replace(".P", "")
+        if not q:
+            return []
+        close_all = q in ("HEPSI", "HEPSİ", "ALL", "TUMU", "TÜMÜ")
+
+        with self._lock:
+            positions = self.get_open_positions_detailed()
+            if self._exchange and not Config.DRY_RUN and not self._exchange.markets:
+                try:
+                    self._exchange.load_markets()
+                except Exception as exc:
+                    logger.warning("Kapatma öncesi market yükleme uyarısı: %s", exc)
+
+            closed: list[dict[str, Any]] = []
+            for pos in positions:
+                ticker = pos["ticker"]
+                base = _ticker_base(ticker)
+                if not close_all and ticker != q and base != q:
+                    continue
+                close_order_side = "sell" if pos["side"] == "long" else "buy"
+                self._place_market_order(
+                    symbol=pos["symbol"],
+                    order_side=close_order_side,
+                    amount=pos["size"],
+                    position_side=pos["side"],
+                    reduce_only=True,
+                )
+                self._active_trades.pop(pos["symbol"], None)
+                closed.append(pos)
+            return closed
 
     def _get_ref_price(self, symbol: str, fallback_price: float) -> float:
         if Config.DRY_RUN or self._exchange is None:
@@ -1445,10 +1532,267 @@ def imap_idle_worker(stop_event: threading.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Telegram Komut Dinleyicisi (/kasa, /durum, /pozisyonlar, /coinler, /kapat)
+# ---------------------------------------------------------------------------
+def _clear_watcher_active_trade(ccxt_symbol: str) -> None:
+    """Manuel /kapat sonrası tv_watcher içindeki açık işlem kaydını temizler."""
+    if not tv_watcher:
+        return
+    target_ticker = _symbol_to_ticker(ccxt_symbol)
+    coin_states = getattr(tv_watcher, "_coin_states", None) or {}
+    for sym_key, st in coin_states.items():
+        if _symbol_to_ticker(sym_key) == target_ticker:
+            st["active_trade"] = None
+
+
+def _register_telegram_commands() -> None:
+    """Telegram sohbet menüsüne bot komutlarını kaydeder ve eski webhook'u temizler."""
+    if not Config.TELEGRAM_BOT_TOKEN:
+        return
+    base = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}"
+    commands = [
+        {"command": "kasa", "description": "Güncel kasa, cüzdan ve açık K/Z"},
+        {"command": "durum", "description": "Bot, motor ve bağlantı durumu"},
+        {"command": "pozisyonlar", "description": "Bybit açık pozisyonları listele"},
+        {"command": "coinler", "description": "İzlenen coinlerin canlı PSL AI özeti"},
+        {"command": "kapat", "description": "Pozisyon kapat (/kapat SOL veya /kapat HEPSI)"},
+        {"command": "yardim", "description": "Tüm komutları göster"},
+    ]
+    try:
+        requests.post(f"{base}/deleteWebhook", json={"drop_pending_updates": False}, timeout=8)
+        requests.post(f"{base}/setMyCommands", json={"commands": commands}, timeout=8)
+    except Exception as exc:
+        logger.debug("Telegram komut menüsü kaydedilemedi: %s", exc)
+
+
+def _active_engine_display_name() -> str:
+    if Config.ENGINE_MODE != "PSL_TV" and Config.QUANT_MODE == "VELEZ_ULTRA":
+        return "Velez PCT Ultra (Optimum ST6)"
+    if Config.ENGINE_MODE != "PSL_TV":
+        return f"Quant Dual-Alpha ({Config.QUANT_MODE})"
+    return "PSL AI v2.2.2 (WebSocket · 3 TP · Fitil SL)"
+
+
+def _handle_telegram_command(text: str, chat_id: str) -> Optional[str]:
+    """Yetkili Telegram sohbetinden gelen /komut mesajlarını işler ve yanıt gönderir."""
+    if str(chat_id).strip() != str(Config.TELEGRAM_CHAT_ID).strip():
+        return None
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+
+    parts = stripped.split(maxsplit=1)
+    cmd = parts[0].lower().split("@", 1)[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    mode_tag = trader._short_mode_tag() if trader else _bot_mode_label()
+    reply_markup: Optional[dict[str, Any]] = None
+
+    if cmd in ("/kasa", "/bakiye"):
+        bal = trader.refresh_balance() if trader else None
+        open_pos = trader.get_open_positions_detailed() if trader else []
+        eq_val = float(bal) if bal is not None else 0.0
+        wallet_val = float(trader.usdt_wallet) if (trader and trader.usdt_wallet is not None) else eq_val
+        upnl_val = float(trader.usdt_upnl) if (trader and trader.usdt_upnl is not None) else 0.0
+        avail_val = float(trader.usdt_available) if (trader and trader.usdt_available is not None) else eq_val
+        if Config.MARGIN_PCT > 0:
+            est_m = eq_val * (Config.MARGIN_PCT / 100.0)
+            margin_info = f"Kasanın %{Config.MARGIN_PCT:g}'u (~{est_m:.2f} USDT)"
+        else:
+            margin_info = f"{Config.MARGIN_USDT:g} USDT"
+        msg = (
+            f"💰 <b>KASA ÖZETİ</b> · <code>[{html.escape(mode_tag)}]</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>Toplam Kasa (Equity):</b> <code>{eq_val:.2f} USDT</code>\n"
+            f"👛 <b>Cüzdan (Wallet):</b> <code>{wallet_val:.2f} USDT</code>\n"
+            f"📊 <b>Açık K/Z (uPnL):</b> <code>{upnl_val:+.2f} USDT</code>\n"
+            f"🆓 <b>Boş Marjin (Available):</b> <code>{avail_val:.2f} USDT</code>\n"
+            f"📦 <b>Açık Pozisyon:</b> <code>{len(open_pos)}</code>\n"
+            f"⚙️ <b>İşlem Başı Marjin:</b> <code>{html.escape(margin_info)}</code>"
+        )
+
+    elif cmd in ("/durum", "/status"):
+        bal = trader.refresh_balance() if trader else None
+        open_pos = trader.get_open_positions_detailed() if trader else []
+        status = tv_watcher.get_status() if tv_watcher else {}
+        coins_dict = status.get("coins") or {}
+        detected_cnt = sum(1 for c in coins_dict.values() if c.get("indicator_detected"))
+        total_cnt = len(coins_dict) or len([s for s in Config.TV_SYMBOL.split(",") if s.strip()])
+        active_lev = trader._resolve_leverage({"tf": Config.TV_INTERVAL}, "") if trader else Config.DEFAULT_LEVERAGE
+        tf_label = _format_tf_label(Config.TV_INTERVAL)
+        bybit_str = "✅ Bağlı" if (trader and trader.connected) else ("🧪 DRY-RUN" if Config.DRY_RUN else "❌ Bağlı Değil")
+        eq_str = f"{bal:.2f} USDT" if bal is not None else "—"
+        if Config.MARGIN_PCT > 0:
+            margin_cfg = f"%{Config.MARGIN_PCT:g} Kasa"
+        else:
+            margin_cfg = f"{Config.MARGIN_USDT:g} USDT"
+        msg = (
+            f"🤖 <b>BOT DURUMU</b> · <code>[{html.escape(mode_tag)}]</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🔌 <b>Bybit:</b> {bybit_str} (<code>{html.escape(_bot_mode_label())}</code>)\n"
+            f"🧠 <b>Motor:</b> <code>{html.escape(_active_engine_display_name())}</code>\n"
+            f"📡 <b>Akış:</b> <code>{html.escape(str(status.get('state') or '—'))}</code> ({detected_cnt}/{total_cnt} coin)\n"
+            f"⏱️ <b>Zaman Dilimi / Kaldıraç:</b> <code>{html.escape(tf_label)}</code> · <code>{active_lev}x</code>\n"
+            f"⚙️ <b>Marjin / Açık İşlem:</b> <code>{html.escape(margin_cfg)}</code> · <code>{len(open_pos)}</code> açık\n"
+            f"💰 <b>Toplam Kasa:</b> <code>{html.escape(eq_str)}</code>"
+        )
+        if Config.PUBLIC_URL:
+            reply_markup = {"inline_keyboard": [[{"text": "🖥️ Canlı Web Paneli", "url": Config.PUBLIC_URL}]]}
+
+    elif cmd in ("/pozisyonlar", "/poz", "/acik", "/açık"):
+        positions = trader.get_open_positions_detailed() if trader else []
+        if not positions:
+            msg = (
+                f"📭 <b>AÇIK POZİSYON YOK</b> · <code>[{html.escape(mode_tag)}]</code>\n"
+                f"Şu anda Bybit üzerinde açık işlem bulunmuyor."
+            )
+        else:
+            lines = [
+                f"📊 <b>AÇIK POZİSYONLAR ({len(positions)})</b> · <code>[{html.escape(mode_tag)}]</code>",
+                "━━━━━━━━━━━━━━━━━━",
+            ]
+            total_upnl = 0.0
+            for pos in positions[:12]:
+                total_upnl += float(pos.get("upnl") or 0.0)
+                badge = "🟢 LONG" if pos["side"] == "long" else "🔴 SHORT"
+                base = _ticker_base(pos["ticker"])
+                sl_str = _fmt_price(pos.get("stop_loss")) if pos.get("stop_loss") else "Yok"
+                lines.append(
+                    f"{badge} <code>#{html.escape(base)}</code> · <code>{pos['leverage']}x</code>\n"
+                    f"├ <b>Fiyat:</b> <code>{_fmt_price(pos['entry_price'])}</code> → <code>{_fmt_price(pos['mark_price'])}</code> · <b>SL:</b> <code>{sl_str}</code>\n"
+                    f"└ <b>Miktar:</b> <code>{_fmt_qty(pos['size'])}</code> · <b>K/Z:</b> <code>{pos['upnl']:+.2f} USDT</code>"
+                )
+            lines.append(f"\n💵 <b>Toplam Açık K/Z:</b> <code>{total_upnl:+.2f} USDT</code>")
+            msg = "\n".join(lines)
+
+    elif cmd in ("/coinler", "/liste"):
+        status = tv_watcher.get_status() if tv_watcher else {}
+        coins_dict = status.get("coins") or {}
+        if not coins_dict:
+            msg = "⏳ Henüz coin verisi yüklenmedi, birkaç saniye sonra tekrar deneyin."
+        else:
+            lines = [
+                f"🪙 <b>İZLENEN COİNLER ({len(coins_dict)})</b> · <code>{html.escape(_format_tf_label(Config.TV_INTERVAL))}</code>",
+                "━━━━━━━━━━━━━━━━━━",
+            ]
+            for sym, c in list(coins_dict.items())[:15]:
+                parsed = c.get("parsed_table") or {}
+                base = _ticker_base(sym)
+                px = _fmt_price(c.get("live_price"))
+                p_side = (parsed.get("plan_side") or "").upper()
+                side_icon = "🟢" if p_side == "LONG" else ("🔴" if p_side == "SHORT" else "⚪")
+                p_status = parsed.get("plan_status") or "beklemede"
+                verdict = parsed.get("verdict") or "—"
+                entry_s = _fmt_price(parsed.get("entry"))
+                sl_s = _fmt_price(parsed.get("sl"))
+                lines.append(
+                    f"{side_icon} <b>{html.escape(base)}</b> (<code>{px}</code>) · {html.escape(verdict)} · <code>{html.escape(p_status)}</code>\n"
+                    f"└ Giriş: <code>{entry_s}</code> · SL: <code>{sl_s}</code>"
+                )
+            msg = "\n".join(lines)
+
+    elif cmd == "/kapat":
+        if not arg:
+            msg = (
+                "ℹ️ <b>POZİSYON KAPATMA KULLANIMI</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "• Tek coin kapat: <code>/kapat SOL</code>\n"
+                "• Tümünü kapat: <code>/kapat HEPSI</code>"
+            )
+        elif not trader:
+            msg = "❌ Bot işlem motoru henüz hazır değil."
+        else:
+            closed = trader.close_position_by_query(arg)
+            if not closed:
+                msg = f"ℹ️ <code>{html.escape(arg.upper())}</code> ile eşleşen açık pozisyon bulunamadı."
+            else:
+                for pos in closed:
+                    _clear_watcher_active_trade(pos["symbol"])
+                bal = trader.refresh_balance()
+                lines = [
+                    f"🛑 <b>MANUEL KAPATMA TAMAMLANDI ({len(closed)})</b> · <code>[{html.escape(mode_tag)}]</code>",
+                    "━━━━━━━━━━━━━━━━━━",
+                ]
+                for pos in closed:
+                    base = _ticker_base(pos["ticker"])
+                    lines.append(
+                        f"• <code>#{html.escape(base)}</code> ({pos['side'].upper()}) · Miktar: <code>{_fmt_qty(pos['size'])}</code>"
+                    )
+                if bal is not None:
+                    lines.append(f"\n💼 <b>Güncel Kasa:</b> <code>{bal:.2f} USDT</code>")
+                msg = "\n".join(lines)
+
+    elif cmd in ("/yardim", "/yardım", "/help", "/start"):
+        msg = (
+            f"📋 <b>BOT KOMUTLARI</b> · <code>[{html.escape(mode_tag)}]</code>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "• <code>/kasa</code> — Güncel kasa, cüzdan ve açık K/Z\n"
+            "• <code>/durum</code> — Aktif motor, kaldıraç ve bağlantı durumu\n"
+            "• <code>/pozisyonlar</code> — Bybit açık işlemleri ve SL/K/Z\n"
+            "• <code>/coinler</code> — İzlenen coinlerin canlı PSL AI özeti\n"
+            "• <code>/kapat SOL</code> — Tek bir açık pozisyonu kapat\n"
+            "• <code>/kapat HEPSI</code> — Tüm açık pozisyonları acil kapat\n"
+            "• <code>/yardim</code> — Bu yardım menüsü"
+        )
+    else:
+        msg = f"❓ Bilinmeyen komut: <code>{html.escape(cmd)}</code>\nKomut listesi için <code>/yardim</code> yazın."
+
+    send_telegram(msg, reply_markup=reply_markup, chat_id=chat_id)
+    return msg
+
+
+def telegram_command_worker(stop_event: threading.Event) -> None:
+    """Telegram getUpdates uzun yoklaması ile sohbet komutlarını anlık dinler."""
+    if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
+        return
+
+    startup_ts = time.time()
+    _register_telegram_commands()
+    api_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset = 0
+    logger.info("Telegram komut dinleyicisi başlatıldı (/kasa, /durum, /pozisyonlar, /coinler, /kapat, /yardim).")
+
+    while not stop_event.is_set():
+        try:
+            params: dict[str, Any] = {
+                "timeout": 25,
+                "allowed_updates": json.dumps(["message"]),
+            }
+            if offset > 0:
+                params["offset"] = offset
+            resp = requests.get(api_url, params=params, timeout=35)
+            if resp.status_code == 409:
+                logger.debug("Telegram getUpdates çakışması (409), 5 sn bekleniyor...")
+                stop_event.wait(5)
+                continue
+            if not resp.ok:
+                logger.warning("Telegram getUpdates hatası (%s): %s", resp.status_code, resp.text[:160])
+                stop_event.wait(5)
+                continue
+
+            data = resp.json()
+            for upd in data.get("result") or []:
+                upd_id = upd.get("update_id")
+                if isinstance(upd_id, int):
+                    offset = upd_id + 1
+                msg = upd.get("message") or {}
+                text = str(msg.get("text") or "")
+                chat_id = str((msg.get("chat") or {}).get("id") or "")
+                msg_date = float(msg.get("date") or 0)
+                if msg_date and msg_date < startup_ts - 10:
+                    continue
+                if text.strip().startswith("/"):
+                    _handle_telegram_command(text, chat_id)
+        except Exception as exc:
+            logger.debug("Telegram komut dinleyici uyarısı: %s", exc)
+            stop_event.wait(5)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI Yaşam Döngüsü, Türkçe Web Paneli ve Endpointler
 # ---------------------------------------------------------------------------
 _stop_event = threading.Event()
 _imap_thread: Optional[threading.Thread] = None
+_tg_cmd_thread: Optional[threading.Thread] = None
 tv_watcher: Optional[TradingViewPlaywrightWatcher] = None
 
 
@@ -1635,7 +1979,7 @@ def _render_dashboard_html() -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global trader, _imap_thread, tv_watcher
+    global trader, _imap_thread, _tg_cmd_thread, tv_watcher
     trader = BybitTrader()
 
     if Config.ENABLE_PLAYWRIGHT:
@@ -1661,6 +2005,15 @@ async def lifespan(_: FastAPI):
             name="imap-idle-worker",
         )
         _imap_thread.start()
+
+    if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+        _tg_cmd_thread = threading.Thread(
+            target=telegram_command_worker,
+            args=(_stop_event,),
+            daemon=True,
+            name="telegram-cmd-worker",
+        )
+        _tg_cmd_thread.start()
 
     mode = _bot_mode_label()
     bal_val = trader.usdt_balance
@@ -1731,7 +2084,8 @@ async def lifespan(_: FastAPI):
         f"⚙️ <b>Risk & Motor Ayarları</b>\n"
         f"├ <b>Marjin / İşlem:</b> <code>{html.escape(startup_margin_str)}</code>\n"
         f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{active_lev}x</code> (Maks {Config.MAX_LEVERAGE}x) · <code>{max_open_str}</code>\n"
-        f"└ <b>Motor:</b> {tv_status_label}",
+        f"└ <b>Motor:</b> {tv_status_label}\n\n"
+        f"💬 <i>Komutlar: /kasa · /durum · /pozisyonlar · /coinler · /yardim</i>",
         reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,
     )
     yield
@@ -1740,6 +2094,8 @@ async def lifespan(_: FastAPI):
         tv_watcher.stop()
     if _imap_thread and _imap_thread.is_alive():
         _imap_thread.join(timeout=3)
+    if _tg_cmd_thread and _tg_cmd_thread.is_alive():
+        _tg_cmd_thread.join(timeout=3)
 
 
 app = FastAPI(title="PSL AI v2.2.2 Bybit Bot", lifespan=lifespan)
