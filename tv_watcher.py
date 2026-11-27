@@ -1,7 +1,7 @@
 """
-PSL AI v2.1 - Hafif Doğrudan TradingView WebSocket Motoru (~35 MB RAM)
+PSL AI v2.2.2 - Hafif Doğrudan TradingView WebSocket Motoru (~35 MB RAM)
 Tarayıcı (Chrome/Docker) gerektirmeden TradingView'ın veri soketi üzerinden
-Kripto Pusulası'nın orijinal PSL AI v2.1 indikatörünü doğrudan çalıştırır ve
+Kripto Pusulası'nın güncel PSL AI v2.2.2 indikatörünü doğrudan çalıştırır ve
 tüm plot/tablo sinyallerini Bybit botuna iletir.
 """
 
@@ -24,7 +24,7 @@ import requests
 
 logger = logging.getLogger("psl-tv-watcher")
 
-ENGINE_MODE = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
+ENGINE_MODE = os.getenv("ENGINE_MODE", "PSL_TV").strip().upper()
 QUANT_MODE = os.getenv("QUANT_MODE", "VELEZ_ULTRA").strip().upper()
 
 PSL_SCRIPT_ID = "PUB;dc403b2eacfd4347a5e1b6244f203220"
@@ -151,29 +151,32 @@ def _extract_first_price(line: str, label_pattern: str) -> Optional[float]:
 
 def _tf_close_pct_list(interval: str) -> list[int]:
     """
-    Zaman dilimine göre optimize edilmiş kısmi kâr alma oranlarını döndürür:
-    - 1 saat (60m) ve üzeri: [40, 30, 20, 10] (büyük trendleri taşıyıp kârı maksimize eder)
-    - 30 dk ve altı: [55, 15, 15, 15] (TP1'de hızlı ağırlık alıp geri dönüş riskini azaltır)
+    PSL AI v2.2.2 3-TP kısmi kâr alma oranlarını döndürür: [30, 30, 40, 0]
+    (TP3 vurulduğunda kalan tüm pozisyon %100 kapatılır).
     """
-    norm = _normalize_interval(interval or "60").upper()
-    if norm in ("60", "120", "240", "D"):
-        return [40, 30, 20, 10]
-    return [55, 15, 15, 15]
+    _ = interval
+    return [30, 30, 40, 0]
 
 
-def _tf_sim_leverage(interval: str, fallback: int = 20) -> int:
-    """TradingView iç simülasyon tablosunun (in_29) ve Quant motorunun kaldıracını belirler."""
-    norm = _normalize_interval(interval or "5").upper()
+def _tf_tp1_moves_sl_to_entry(interval: str) -> bool:
+    """PSL AI v2.2.2 zaman dilimine göre TP1 sonrasında SL'nin girişe çekilip çekilmeyeceğini döndürür."""
+    norm = _normalize_interval(interval or "15").upper()
+    return norm in ("15", "30", "240", "D")
+
+
+def _tf_sim_leverage(interval: str, fallback: int = 15) -> int:
+    """TradingView iç simülasyon tablosunun (in_29) ve bot motorunun kaldıracını belirler."""
+    norm = _normalize_interval(interval or "15").upper()
     mapping = {
         "1": 20,
-        "3": 20,
-        "5": 20,
-        "15": 20,
-        "30": 20,
-        "60": 15,
-        "120": 15,
-        "240": 8,
-        "D": 8,
+        "3": 15,
+        "5": 10,
+        "15": 15,
+        "30": 12,
+        "60": 8,
+        "120": 6,
+        "240": 3,
+        "D": 3,
     }
     return mapping.get(norm, fallback)
 
@@ -602,7 +605,7 @@ class TradingViewPlaywrightWatcher:
     """
     Hafif TradingView WebSocket izleyicisi (bot.py ile tam uyumlu sınıf adı).
     Bir veya birden fazla coini doğrudan TradingView sunucusunda çalıştırılan
-    PSL AI v2.1 (PUB;dc403b2eacfd4347a5e1b6244f203220) üzerinden anlık izler.
+    PSL AI v2.2.2 (PUB;dc403b2eacfd4347a5e1b6244f203220) üzerinden anlık izler.
     """
 
     def __init__(
@@ -615,7 +618,7 @@ class TradingViewPlaywrightWatcher:
         sessionid_sign: str = "",
         poll_sec: float = 2.0,
         secret_key: str = "",
-        default_leverage: int = 50,
+        default_leverage: int = 15,
         bybit_testnet: bool = False,
     ) -> None:
         raw_list = [s.strip() for s in tv_symbol.split(",") if s.strip()]
@@ -626,7 +629,7 @@ class TradingViewPlaywrightWatcher:
                 seen_syms.append(norm)
         self.tv_symbols: list[str] = seen_syms[:15] or ["BYBIT:BTCUSDT.P"]
         self.tv_symbol = self.tv_symbols[0]
-        self.tv_interval = _normalize_interval(tv_interval or "5")
+        self.tv_interval = _normalize_interval(tv_interval or "15")
         self.engine_mode = os.getenv("ENGINE_MODE", ENGINE_MODE).strip().upper()
         self.quant_mode = os.getenv("QUANT_MODE", QUANT_MODE).strip().upper()
         self.chart_url = chart_url.strip()
@@ -765,7 +768,7 @@ class TradingViewPlaywrightWatcher:
         return None
 
     def _fetch_psl_study_args(self) -> dict[str, Any]:
-        """TradingView pine-facade üzerinden güncel PSL AI v2.1 meta verilerini indirir."""
+        """TradingView pine-facade üzerinden güncel PSL AI v2.2.2 meta verilerini indirir."""
         resp = requests.get(
             PSL_TRANSLATE_URL,
             headers={"User-Agent": "Mozilla/5.0"},
@@ -780,11 +783,13 @@ class TradingViewPlaywrightWatcher:
         return {
             "text": inputs["text"],
             "pineId": meta["scriptIdPart"],
-            "pineVersion": (meta.get("pine") or {}).get("version", "3.0"),
-            "in_27": {"v": 100, "f": True, "t": "integer"},
-            "in_28": {"v": 15, "f": True, "t": "integer"},
-            "in_29": {"v": sim_lev, "f": True, "t": "integer"},
-            "in_39": {"v": True, "f": True, "t": "bool"},
+            "pineVersion": (meta.get("pine") or {}).get("version", "8.0"),
+            "in_27": {"v": 100.0, "f": True, "t": "float"},
+            "in_28": {"v": 10.0, "f": True, "t": "float"},
+            "in_29": {"v": float(sim_lev), "f": True, "t": "float"},
+            "in_37": {"v": True, "f": True, "t": "bool"},
+            "in_65": {"v": float(_tf_sim_leverage("15", 15)), "f": True, "t": "float"},
+            "in_66": {"v": float(_tf_sim_leverage("60", 8)), "f": True, "t": "float"},
         }
 
     def _run_loop(self) -> None:
@@ -1005,8 +1010,8 @@ class TradingViewPlaywrightWatcher:
                                                 fired_keys,
                                             )
                                             if (
-                                                _is_triggered(self._plot(latest_bar_plots, 9))
-                                                or _is_triggered(self._plot(latest_bar_plots, 10))
+                                                _is_triggered(self._plot(latest_bar_plots, 8))
+                                                or _is_triggered(self._plot(latest_bar_plots, 9))
                                             ):
                                                 last_entry_bar_time = latest_bar_time
 
@@ -1052,7 +1057,7 @@ class TradingViewPlaywrightWatcher:
 
     def _sync_levels_from_plots(self, parsed: dict[str, Any], v: list[Any]) -> None:
         """
-        v[1]=Entry, v[2]=Stop, v[3]=TP1, v[4]=TP2, v[5]=TP3, v[6]=TP4
+        PSL AI v2.2.2: v[1]=Entry, v[2]=Stop, v[3]=TP1, v[4]=TP2, v[5]=TP3 (v[6]=Exit).
         Tablo aktif veya tetik bekliyorsa tablo değerlerini korur; yalnızca tablo boşsa ('—')
         son işlem plotlarını yedek olarak kullanır.
         """
@@ -1061,7 +1066,7 @@ class TradingViewPlaywrightWatcher:
         if parsed.get("entry") is not None:
             return
 
-        mapping = [(1, "entry"), (2, "sl"), (3, "tp1"), (4, "tp2"), (5, "tp3"), (6, "tp4")]
+        mapping = [(1, "entry"), (2, "sl"), (3, "tp1"), (4, "tp2"), (5, "tp3")]
         any_level = False
         for idx, field in mapping:
             num = _clean_num(self._plot(v, idx))
@@ -1085,7 +1090,7 @@ class TradingViewPlaywrightWatcher:
     ) -> None:
         """
         study_completed sonrası TradingView st1.st boş geldiğinde tüm canlı işlemleri
-        st1.ns.d tablosu ve sds_1 canlı fiyat/mum kapanışı üzerinden yürütür.
+        st1.ns.d tablosu ve sds_1 canlı fiyat/fitil hareketi üzerinden yürütür (PSL AI v2.2.2).
         """
         plan_status = parsed_table.get("plan_status")
         plan_side = parsed_table.get("plan_side")
@@ -1093,14 +1098,13 @@ class TradingViewPlaywrightWatcher:
         tp1 = parsed_table.get("tp1")
         tp2 = parsed_table.get("tp2")
         tp3 = parsed_table.get("tp3")
-        tp4 = parsed_table.get("tp4")
         sl = parsed_table.get("sl")
         checked_tps = parsed_table.get("checked_tps") or []
         live_price = state.get("live_price")
         bar_t = sds_bar_time or int(time.time())
         plots = latest_plots or []
 
-        has_levels = all(v is not None and v > 0 for v in (entry, tp1, tp2, tp3, tp4, sl))
+        has_levels = all(v is not None and v > 0 for v in (entry, tp1, tp2, tp3, sl))
 
         # 1. Açık İşlem Takibi
         active = state.get("active_trade")
@@ -1128,9 +1132,9 @@ class TradingViewPlaywrightWatcher:
             if not active["hit_tps"] and plan_status == "active" and sl is not None and sl > 0:
                 active["sl"] = sl
 
-            # TP1 - TP4 anlık kontrol (✓ işareti veya fiyat teması)
+            # TP1 - TP3 anlık kontrol (✓ işareti veya fitil/fiyat teması)
             tp_just_hit = False
-            for idx in range(1, 5):
+            for idx in range(1, 4):
                 tp_key = f"tp{idx}"
                 if tp_key in active["hit_tps"]:
                     continue
@@ -1144,12 +1148,10 @@ class TradingViewPlaywrightWatcher:
                 if touched:
                     active["hit_tps"].append(tp_key)
                     tp_just_hit = True
-                    if idx == 1:
+                    if idx == 1 and _tf_tp1_moves_sl_to_entry(self.tv_interval):
                         active["sl"] = active["entry"]
                     elif idx == 2:
                         active["sl"] = active["tp1"]
-                    elif idx == 3:
-                        active["sl"] = active["tp2"]
 
                     pct_share = tf_closes[idx - 1]
                     self._emit_event(
@@ -1161,25 +1163,25 @@ class TradingViewPlaywrightWatcher:
                         bar_t,
                         plots,
                         close_pct=pct_share,
-                        new_sl=active["sl"],
+                        new_sl=None if idx == 3 else active["sl"],
                     )
-                    if idx == 4:
+                    if idx == 3:
                         state["active_trade"] = None
                         return
 
-            # TP1+ alındıktan sonra iz süren stopu canlı fiyatta anlık koru (TP vurulduğu aynı tick hariç)
-            if not tp_just_hit and active["hit_tps"] and live_price is not None and active.get("sl"):
-                trail_sl = active["sl"]
-                trail_hit = (
-                    (a_side == "long" and live_price <= trail_sl)
-                    or (a_side == "short" and live_price >= trail_sl)
+            # PSL AI v2.2.2: Fitil değdiği anda Stop Loss (hem giriş stobu hem iz süren SL)
+            if not tp_just_hit and live_price is not None and active.get("sl"):
+                live_sl = active["sl"]
+                sl_touched = (
+                    (a_side == "long" and live_price <= live_sl)
+                    or (a_side == "short" and live_price >= live_sl)
                 )
-                if trail_hit:
+                if sl_touched:
                     self._emit_event(sym, "stop", a_side, live_price, active, bar_t, plots)
                     state["active_trade"] = None
                     return
 
-            # Mum kapanışı Stop kontrolü (sds_1 mum kapanışı)
+            # Mum kapanışı Stop kontrolü (yedek güvenlik)
             if sds_closed_bar is not None:
                 closed_t, closed_p = sds_closed_bar
                 if closed_t * 1000 >= active["opened_candle_ms"]:
@@ -1194,7 +1196,7 @@ class TradingViewPlaywrightWatcher:
 
         # 2. Yeni Giriş Kontrolü
         if state.get("active_trade") is None and plan_status == "active" and plan_side in ("long", "short") and has_levels:
-            plan_sig = f"{sym}|{plan_side}|{entry}|{tp4}"
+            plan_sig = f"{sym}|{plan_side}|{entry}|{tp3}"
             if plan_sig == state.get("last_entered_sig"):
                 return
 
@@ -1212,7 +1214,7 @@ class TradingViewPlaywrightWatcher:
                 "tp1": tp1,
                 "tp2": tp2,
                 "tp3": tp3,
-                "tp4": tp4,
+                "tp4": None,
                 "sl": sl,
                 "hit_tps": [],
                 "opened_candle_ms": bar_t * 1000,
@@ -1230,11 +1232,12 @@ class TradingViewPlaywrightWatcher:
         v: list[Any],
         fired_keys: set[str],
     ) -> None:
-        long_hit = _is_triggered(self._plot(v, 9))
-        short_hit = _is_triggered(self._plot(v, 10))
-        stop_hit = _is_triggered(self._plot(v, 16))
-        liq_hit = _is_triggered(self._plot(v, 17))
-        closed_hit = _is_triggered(self._plot(v, 18))
+        long_hit = _is_triggered(self._plot(v, 8))
+        short_hit = _is_triggered(self._plot(v, 9))
+        tp3_hit = _is_triggered(self._plot(v, 13))
+        stop_hit = _is_triggered(self._plot(v, 14))
+        liq_hit = _is_triggered(self._plot(v, 15))
+        closed_hit = _is_triggered(self._plot(v, 16))
 
         if long_hit or short_hit:
             side = "long" if long_hit else "short"
@@ -1243,12 +1246,12 @@ class TradingViewPlaywrightWatcher:
                 fired_keys.add(fkey)
                 self._start_and_emit_entry(sym, state, side, bar_t, v)
 
-        if stop_hit or (closed_hit and not _is_triggered(self._plot(v, 15)) and not liq_hit):
+        if stop_hit or (closed_hit and not tp3_hit and not liq_hit):
             fkey = f"stop|{bar_t}"
             active = state.get("active_trade")
             if fkey not in fired_keys and active:
                 fired_keys.add(fkey)
-                exit_p = _clean_num(self._plot(v, 7)) or active.get("sl") or state.get("live_price") or 0.0
+                exit_p = _clean_num(self._plot(v, 6)) or active.get("sl") or state.get("live_price") or 0.0
                 self._emit_event(sym, "stop", active["side"], exit_p, active, bar_t, v)
                 state["active_trade"] = None
 
@@ -1261,34 +1264,62 @@ class TradingViewPlaywrightWatcher:
         fired_keys: set[str],
         last_entry_bar_time: Optional[int],
     ) -> None:
-        # Eğer mum kapanışı zaten confirmed entry üretiyorsa anlık giriş yalnızca yeni plan yoksa bekle
+        _ = last_entry_bar_time
         active = state.get("active_trade")
         if not active:
             return
 
         a_side = active["side"]
         tf_closes = _tf_close_pct_list(self.tv_interval)
-        for tp_idx, plot_idx in ((1, 12), (2, 13), (3, 14), (4, 15)):
+        for tp_idx, plot_idx in ((1, 11), (2, 12), (3, 13)):
             if _is_triggered(self._plot(v, plot_idx)):
                 tp_key = f"tp{tp_idx}"
+                if tp_key in active["hit_tps"]:
+                    continue
                 fkey = f"{tp_key}|{active['trade_id']}"
                 if fkey not in fired_keys:
                     fired_keys.add(fkey)
-                    if tp_key not in active["hit_tps"]:
-                        active["hit_tps"].append(tp_key)
+                    active["hit_tps"].append(tp_key)
+                    if tp_idx == 1 and _tf_tp1_moves_sl_to_entry(self.tv_interval):
+                        active["sl"] = active["entry"]
+                    elif tp_idx == 2:
+                        active["sl"] = active["tp1"]
+
                     tp_price = _clean_num(self._plot(v, tp_idx + 2)) or state.get("live_price") or 0.0
-                    new_sl = _clean_num(self._plot(v, 2))
+                    plot_sl = _clean_num(self._plot(v, 2))
+                    if plot_sl and plot_sl > 0 and tp_idx < 3:
+                        active["sl"] = plot_sl
+
                     pct_share = tf_closes[tp_idx - 1]
-                    self._emit_event(sym, tp_key, a_side, tp_price, active, bar_t, v, close_pct=pct_share, new_sl=new_sl)
-                    if tp_idx == 4:
+                    self._emit_event(
+                        sym,
+                        tp_key,
+                        a_side,
+                        tp_price,
+                        active,
+                        bar_t,
+                        v,
+                        close_pct=pct_share,
+                        new_sl=None if tp_idx == 3 else active["sl"],
+                    )
+                    if tp_idx == 3:
                         state["active_trade"] = None
                         return
 
-        if _is_triggered(self._plot(v, 17)):
+        if _is_triggered(self._plot(v, 14)):
+            fkey = f"stop|{active['trade_id']}"
+            if fkey not in fired_keys:
+                fired_keys.add(fkey)
+                exit_p = _clean_num(self._plot(v, 6)) or active.get("sl") or state.get("live_price") or 0.0
+                self._emit_event(sym, "stop", a_side, exit_p, active, bar_t, v)
+                state["active_trade"] = None
+                return
+
+        if _is_triggered(self._plot(v, 15)):
             fkey = f"liq|{active['trade_id']}"
             if fkey not in fired_keys:
                 fired_keys.add(fkey)
-                exit_p = _clean_num(self._plot(v, 7)) or state.get("live_price") or 0.0
+                exit_p = _clean_num(self._plot(v, 6)) or state.get("live_price") or 0.0
                 self._emit_event(sym, "liquidation", a_side, exit_p, active, bar_t, v)
                 state["active_trade"] = None
 
@@ -1305,7 +1336,6 @@ class TradingViewPlaywrightWatcher:
         tp1_p = _clean_num(self._plot(v, 3)) or 0.0
         tp2_p = _clean_num(self._plot(v, 4)) or 0.0
         tp3_p = _clean_num(self._plot(v, 5)) or 0.0
-        tp4_p = _clean_num(self._plot(v, 6)) or 0.0
 
         self._trade_seq += 1
         plan = {
@@ -1315,12 +1345,13 @@ class TradingViewPlaywrightWatcher:
             "tp1": tp1_p,
             "tp2": tp2_p,
             "tp3": tp3_p,
-            "tp4": tp4_p,
+            "tp4": None,
             "sl": sl_p,
             "hit_tps": [],
             "opened_candle_ms": bar_t * 1000,
         }
         state["active_trade"] = plan
+        state["last_entered_sig"] = f"{sym}|{side}|{entry_p}|{tp3_p}"
         self._emit_event(sym, "entry", side, entry_p, plan, bar_t, v)
 
     def _emit_event(
@@ -1335,7 +1366,7 @@ class TradingViewPlaywrightWatcher:
         close_pct: Optional[int] = None,
         new_sl: Optional[float] = None,
         extra_payload: Optional[dict[str, Any]] = None,
-        source_label: str = "TradingView WebSocket (PSL AI)",
+        source_label: str = "TradingView WebSocket (PSL AI v2.2.2)",
     ) -> Any:
         payload: dict[str, Any] = {
             "key": self.secret_key,
@@ -1349,30 +1380,36 @@ class TradingViewPlaywrightWatcher:
             "price": price,
         }
         if event == "entry":
+            auto_tf = os.getenv("AUTO_TF_LEVERAGE", "true").strip().lower() in ("1", "true", "yes", "on", "evet")
+            entry_lev = _tf_sim_leverage(self.tv_interval, self.default_leverage) if auto_tf else self.default_leverage
             payload.update(
                 {
                     "entry": plan["entry"],
                     "tp1": plan["tp1"],
                     "tp2": plan["tp2"],
                     "tp3": plan["tp3"],
-                    "tp4": plan["tp4"],
+                    "tp4": plan.get("tp4"),
                     "sl": plan["sl"],
-                    "leverage": self.default_leverage,
+                    "hard_sl": True,
+                    "leverage": entry_lev,
                     "close_pct": _tf_close_pct_list(self.tv_interval),
                 }
             )
         elif event.startswith("tp"):
             tp_num = int(event[-1])
-            default_pct = _tf_close_pct_list(self.tv_interval)[tp_num - 1]
-            pct_val = 100 if event == "tp4" else (default_pct if close_pct is None else close_pct)
+            tf_pcts = _tf_close_pct_list(self.tv_interval)
+            default_pct = tf_pcts[tp_num - 1]
+            later_sum = sum(tf_pcts[tp_num:]) if tp_num < len(tf_pcts) else 0
+            is_final = (event == "tp4") or (later_sum <= 0)
+            pct_val = default_pct if close_pct is None else close_pct
             payload.update(
                 {
                     "close_pct": pct_val,
-                    "sl": None if event == "tp4" else (new_sl or plan["sl"]),
+                    "sl": None if is_final else (new_sl or plan["sl"]),
                 }
             )
         elif event in ("stop", "liquidation"):
-            pnl_val = _clean_num(self._plot(v, 8)) or 0.0
+            pnl_val = _clean_num(self._plot(v, 7)) or 0.0
             payload.update({"result": event, "pnl": pnl_val})
 
         if extra_payload:

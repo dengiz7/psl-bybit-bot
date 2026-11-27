@@ -1,6 +1,6 @@
 """
-PSL AI v2.1 -> Bybit Futures Otomatik Al-Sat Botu
-- Ücretsiz TradingView Hesaplar için Bulut Görünmez Tarayıcı (Playwright) Tablo Okuyucusu
+PSL AI v2.2.2 -> Bybit Futures Otomatik Al-Sat Botu
+- TradingView WebSocket PSL AI v2.2.2 (3 TP · Fitil Bazlı Hard SL) Okuyucusu
 - Gmail IMAP IDLE (Anlık Push E-posta) Okuyucu (Opsiyonel)
 - Ücretli/Deneme Hesaplar veya Köprüler için FastAPI Webhook Endpoint
 - Bybit V5 USDT Perpetual (Futures) Emir Motoru (ccxt)
@@ -86,7 +86,7 @@ class Config:
     DRY_RUN: bool = _env_bool("DRY_RUN", False)
     MARGIN_PCT: float = _env_float("MARGIN_PCT", 5.0)
     MARGIN_USDT: float = _env_float("MARGIN_USDT", 10.0)
-    DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 20)
+    DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 15)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 20)
     MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 0)
     AUTO_TF_LEVERAGE: bool = _env_bool("AUTO_TF_LEVERAGE", True)
@@ -101,13 +101,13 @@ class Config:
     }
     MAX_EMAIL_AGE_SEC: int = _env_int("MAX_EMAIL_AGE_SEC", 180)
 
-    # Veri Akışı (Bybit Quant Dual-Alpha veya TradingView WebSocket)
-    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "QUANT_5M").strip().upper()
+    # Veri Akışı (TradingView WebSocket PSL AI v2.2.2 veya Bybit Quant)
+    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "PSL_TV").strip().upper()
     QUANT_MODE: str = os.getenv("QUANT_MODE", "VELEZ_ULTRA").strip().upper()
     ENABLE_PLAYWRIGHT: bool = _env_bool("ENABLE_PLAYWRIGHT", True)
     TV_CHART_URL: str = os.getenv("TV_CHART_URL", "").strip()
     TV_SYMBOL: str = os.getenv("TV_SYMBOL", "BYBIT:BTCUSDT.P").strip()
-    TV_INTERVAL: str = os.getenv("TV_INTERVAL", "5").strip()
+    TV_INTERVAL: str = os.getenv("TV_INTERVAL", "15").strip()
     TV_SESSIONID: str = os.getenv("TV_SESSIONID", "").strip()
     TV_SESSIONID_SIGN: str = os.getenv("TV_SESSIONID_SIGN", "").strip()
     TV_POLL_SEC: float = _env_float("TV_POLL_SEC", 2.0)
@@ -783,14 +783,22 @@ class BybitTrader:
             tf_table = {
                 "1": 20,
                 "1m": 20,
-                "5": 20,
-                "5m": 20,
-                "15": 20,
-                "15m": 20,
-                "60": 15,
-                "1h": 15,
-                "240": 8,
-                "4h": 8,
+                "3": 15,
+                "3m": 15,
+                "5": 10,
+                "5m": 10,
+                "15": 15,
+                "15m": 15,
+                "30": 12,
+                "30m": 12,
+                "60": 8,
+                "1h": 8,
+                "120": 6,
+                "2h": 6,
+                "240": 3,
+                "4h": 3,
+                "d": 3,
+                "1d": 3,
             }
             req_lev = tf_table.get(tf, Config.DEFAULT_LEVERAGE)
         else:
@@ -830,7 +838,7 @@ class BybitTrader:
             return "Velez PCT Ultra"
         if "Quant" in source:
             return "Quant Dual-Alpha"
-        return "PSL AI v2.1"
+        return "PSL AI v2.2.2"
 
     def _resolve_trade_margin(self) -> tuple[float, str]:
         """İşlem başı kullanılacak marjini hesaplar (MARGIN_PCT > 0 ise Toplam Kasanın yüzdesi)."""
@@ -951,7 +959,7 @@ class BybitTrader:
 
         close_pct = payload.get("close_pct")
         if not isinstance(close_pct, list) or len(close_pct) < 4:
-            close_pct = [25, 25, 25, 25]
+            close_pct = [30, 30, 40, 0]
 
         tf_val = str(payload.get("tf") or Config.TV_INTERVAL)
         entry_px = float(order.get("average") or order.get("price") or ref_price or signal_price or 0.0)
@@ -1049,11 +1057,13 @@ class BybitTrader:
             return
 
         trade_state = dict(self._active_trades.get(symbol) or {})
+        pct_list = trade_state.get("close_pct") or [30, 30, 40, 0]
         pct = payload.get("close_pct")
         if pct is None:
-            pct_list = trade_state.get("close_pct", [25, 25, 25, 25])
             pct = pct_list[tp_index] if tp_index < len(pct_list) else 0
         pct = float(pct)
+        later_sum = sum(float(x) for x in pct_list[tp_index + 1 :]) if tp_index + 1 < len(pct_list) else 0.0
+        is_final_tp = (event == "tp4") or (pct >= 100) or (pct > 0 and later_sum <= 0)
 
         tf_val = str(payload.get("tf") or trade_state.get("tf") or Config.TV_INTERVAL)
         ticker = _symbol_to_ticker(symbol)
@@ -1068,7 +1078,7 @@ class BybitTrader:
         )
 
         new_sl = payload.get("sl")
-        if pct <= 0 and event != "tp4":
+        if pct <= 0 and not is_final_tp:
             # Breakeven / Kâr stobu güncelleme modu: pozisyon kapatılmaz, Bybit borsadaki SL yukarı/aşağı çekilir
             sl_ok = True
             if new_sl:
@@ -1089,7 +1099,7 @@ class BybitTrader:
             send_telegram(msg, reply_markup=buttons)
             return
 
-        if event == "tp4" or pct >= 100:
+        if is_final_tp:
             close_qty = open_qty
         else:
             initial_qty = float(trade_state.get("initial_qty") or open_qty)
@@ -1107,16 +1117,16 @@ class BybitTrader:
             reduce_only=True,
         )
 
-        remaining = max(0.0, open_qty - close_qty)
+        remaining = 0.0 if is_final_tp else max(0.0, open_qty - close_qty)
         if symbol in self._active_trades:
             self._active_trades[symbol]["remaining_qty"] = remaining
             self._active_trades[symbol]["sl"] = new_sl
             self._active_trades[symbol]["be_locked"] = True
-            if event == "tp4" or remaining <= 0:
+            if is_final_tp or remaining <= 0:
                 self._active_trades.pop(symbol, None)
 
         sl_line = ""
-        if event != "tp4" and remaining > 0 and new_sl:
+        if not is_final_tp and remaining > 0 and new_sl:
             sl_val = float(new_sl)
             sl_ok = self._set_exchange_trailing_sl(symbol, side, sl_val)
             if not sl_ok:
@@ -1156,7 +1166,7 @@ class BybitTrader:
 
         header = (
             f"🏆 <b>TÜM HEDEFLER VURULDU — POZİSYON KAPANDI!</b> · <code>[{mode_tag}]</code>"
-            if event == "tp4"
+            if is_final_tp
             else f"💰 <b>{event.upper()} KÂR ALINDI</b> · <code>[{mode_tag}]</code>"
         )
         rem_str = "Kapanış Tamamlandı" if remaining <= 0 else f"Kalan: <code>{_fmt_qty(remaining)}</code>"
@@ -1462,6 +1472,12 @@ def _render_coin_card(coin_data: dict[str, Any], esc: Any) -> str:
             f"SL: {esc(active.get('sl'))} | Vurulan TP: {esc(', '.join(active.get('hit_tps') or []) or 'Yok')}"
         )
 
+    tp3_4_row = (
+        f'<div class="row"><span class="lbl">HEDEF 3 / 4</span><span class="val">{esc(parsed.get("tp3"))} / {esc(parsed.get("tp4"))}</span></div>'
+        if parsed.get("tp4")
+        else f'<div class="row"><span class="lbl">HEDEF 3</span><span class="val">{esc(parsed.get("tp3"))}</span></div>'
+    )
+
     return f"""
       <div class="card">
         <h2>📊 {esc(coin_data.get('symbol'))} · {esc(coin_data.get('interval'))}</h2>
@@ -1471,7 +1487,7 @@ def _render_coin_card(coin_data: dict[str, Any], esc: Any) -> str:
         <div class="row"><span class="lbl">Plan Yönü / Durumu</span><span class="val">{esc(parsed.get('plan_side')).upper()} · {esc(parsed.get('plan_status_text') or parsed.get('plan_status'))}</span></div>
         <div class="row"><span class="lbl">GİRİŞ</span><span class="val">{esc(parsed.get('entry'))}</span></div>
         <div class="row"><span class="lbl">HEDEF 1 / 2</span><span class="val">{esc(parsed.get('tp1'))} / {esc(parsed.get('tp2'))}</span></div>
-        <div class="row"><span class="lbl">HEDEF 3 / 4</span><span class="val">{esc(parsed.get('tp3'))} / {esc(parsed.get('tp4'))}</span></div>
+        {tp3_4_row}
         <div class="row"><span class="lbl">GEÇERSİZ (SL)</span><span class="val">{esc(parsed.get('sl'))}</span></div>
         <div class="row"><span class="lbl">Bot Aktif İşlem</span><span class="val">{active_html}</span></div>
         <div class="row"><span class="lbl">Son Güncelleme</span><span class="val">{esc(coin_data.get('last_update'))}</span></div>
@@ -1507,7 +1523,7 @@ def _render_dashboard_html() -> str:
         )
 
     tf_lev_text = (
-        "Aktif (5dk:20x, 15dk:20x, 1s:15x, 4s:8x)"
+        "Aktif (5dk:10x, 15dk:15x, 1s:8x, 4s:3x)"
         if Config.AUTO_TF_LEVERAGE
         else f"Kapalı (Sabit {Config.DEFAULT_LEVERAGE}x)"
     )
@@ -1517,7 +1533,7 @@ def _render_dashboard_html() -> str:
         else (
             f"Quant 5dk Dual-Alpha ({Config.QUANT_MODE})"
             if Config.ENGINE_MODE != "PSL_TV"
-            else "PSL AI v2.1 (TradingView WebSocket)"
+            else "PSL AI v2.2.2 (TradingView WebSocket)"
         )
     )
     max_open_label = f"Maks {Config.MAX_OPEN_POSITIONS}" if Config.MAX_OPEN_POSITIONS > 0 else "Sınırsız"
@@ -1560,7 +1576,7 @@ def _render_dashboard_html() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PSL AI v2.1 — Bybit Bulut Botu</title>
+  <title>PSL AI v2.2.2 — Bybit Bulut Botu</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #e6edf3; margin: 0; padding: 20px; }}
     .wrap {{ max-width: 1120px; margin: 0 auto; }}
@@ -1668,7 +1684,7 @@ async def lifespan(_: FastAPI):
         else (
             f"🟢 Bybit Quant ({Config.QUANT_MODE})"
             if Config.ENGINE_MODE != "PSL_TV"
-            else ("🟢 TradingView WebSocket" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı")
+            else ("🟢 PSL AI v2.2.2 (WebSocket · 3 TP · Fitil SL)" if Config.ENABLE_PLAYWRIGHT else "⚪ Kapalı")
         )
     )
     bot_title = (
@@ -1677,7 +1693,7 @@ async def lifespan(_: FastAPI):
         else (
             "BYBIT QUANT 5DK DUAL-ALPHA BOT AKTİF"
             if Config.ENGINE_MODE != "PSL_TV"
-            else "PSL AI BYBIT BOT AKTİF"
+            else "PSL AI v2.2.2 — BYBIT BOT AKTİF"
         )
     )
 
@@ -1703,6 +1719,7 @@ async def lifespan(_: FastAPI):
         startup_margin_str = f"Kasanın %{Config.MARGIN_PCT:g}'u{est_m}"
     else:
         startup_margin_str = f"{Config.MARGIN_USDT:g} USDT"
+    active_lev = trader._resolve_leverage({"tf": Config.TV_INTERVAL}, "")
     send_telegram(
         f"✅ <b>{bot_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -1713,7 +1730,7 @@ async def lifespan(_: FastAPI):
         f"<code>{html.escape(coins_preview)}</code>\n\n"
         f"⚙️ <b>Risk & Motor Ayarları</b>\n"
         f"├ <b>Marjin / İşlem:</b> <code>{html.escape(startup_margin_str)}</code>\n"
-        f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{Config.MAX_LEVERAGE}x</code> · <code>{max_open_str}</code>\n"
+        f"├ <b>Kaldıraç / Maks. Açık:</b> <code>{active_lev}x</code> (Maks {Config.MAX_LEVERAGE}x) · <code>{max_open_str}</code>\n"
         f"└ <b>Motor:</b> {tv_status_label}",
         reply_markup={"inline_keyboard": startup_rows} if startup_rows else None,
     )
@@ -1725,7 +1742,7 @@ async def lifespan(_: FastAPI):
         _imap_thread.join(timeout=3)
 
 
-app = FastAPI(title="PSL AI v2.1 Bybit Bot", lifespan=lifespan)
+app = FastAPI(title="PSL AI v2.2.2 Bybit Bot", lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
