@@ -84,7 +84,7 @@ class Config:
 
     # Risk & Pozisyon Ayarları
     DRY_RUN: bool = _env_bool("DRY_RUN", False)
-    MARGIN_PCT: float = _env_float("MARGIN_PCT", 5.0)
+    MARGIN_PCT: float = _env_float("MARGIN_PCT", 10.0)
     MARGIN_USDT: float = _env_float("MARGIN_USDT", 10.0)
     DEFAULT_LEVERAGE: int = _env_int("DEFAULT_LEVERAGE", 15)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 20)
